@@ -1,0 +1,191 @@
+/* Copyright 2025 SGLang Team. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
+#include <ATen/ATen.h>
+#include <c10/core/DeviceGuard.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/all.h>
+
+#include <cstdint>
+#include <sycl/sycl.hpp>
+
+#include "sgl_kernel_export.h"
+#include "sycl/Utils.h"
+
+namespace {
+
+constexpr int kQ4KValuesPerBlock = 256;
+constexpr int kQ4KBytesPerBlock = 144;
+constexpr int kQ4KGroupsPerBlock = 8;
+constexpr int kQ4KValuesPerGroup = 32;
+constexpr int kW4A16BytesPerBlock = kQ4KValuesPerBlock / 2;
+
+template <typename ScaleT>
+class GGUFQ4KRepackKernel;
+
+inline int64_t round_up(int64_t value, int64_t multiple) {
+  return (value + multiple - 1) / multiple * multiple;
+}
+
+template <typename ScaleT>
+void launch_q4_k_repack(
+    sycl::queue& queue,
+    const uint8_t* raw,
+    uint8_t* packed,
+    ScaleT* scales,
+    ScaleT* zeros,
+    int64_t rows,
+    int64_t blocks_per_row) {
+  const int64_t group_count = rows * blocks_per_row * kQ4KGroupsPerBlock;
+  constexpr int64_t kLocalSize = 256;
+  const int64_t global_size = round_up(group_count, kLocalSize);
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<GGUFQ4KRepackKernel<ScaleT>>(
+        sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), [=](sycl::nd_item<1> item) {
+          const int64_t linear_group = item.get_global_linear_id();
+          if (linear_group >= group_count) {
+            return;
+          }
+
+          const int group = linear_group % kQ4KGroupsPerBlock;
+          const int64_t row_block = linear_group / kQ4KGroupsPerBlock;
+          const uint8_t* block = raw + row_block * kQ4KBytesPerBlock;
+
+          const uint16_t d_bits = static_cast<uint16_t>(block[0]) | (static_cast<uint16_t>(block[1]) << 8);
+          const uint16_t dmin_bits = static_cast<uint16_t>(block[2]) | (static_cast<uint16_t>(block[3]) << 8);
+          const float d = static_cast<float>(sycl::bit_cast<sycl::half>(d_bits));
+          const float dmin = static_cast<float>(sycl::bit_cast<sycl::half>(dmin_bits));
+
+          const uint8_t* meta = block + 4;
+          int scale6;
+          int min6;
+          if (group < 4) {
+            scale6 = meta[group] & 0x3f;
+            min6 = meta[group + 4] & 0x3f;
+          } else {
+            const int high_group = group - 4;
+            scale6 = (meta[8 + high_group] & 0x0f) | ((meta[high_group] >> 2) & 0x30);
+            min6 = (meta[8 + high_group] >> 4) | ((meta[4 + high_group] >> 2) & 0x30);
+          }
+
+          float scale = d * static_cast<float>(scale6);
+          const float minimum = dmin * static_cast<float>(min6);
+          const bool zero_scale = scale == 0.0f;
+          const float zero = zero_scale ? minimum : minimum / scale;
+          if (zero_scale) {
+            scale = 1.0f;
+          }
+
+          scales[linear_group] = static_cast<ScaleT>(scale);
+          zeros[linear_group] = static_cast<ScaleT>(zero);
+
+          // GGUF Q4_K stores four 32-byte regions. Within each region the
+          // low nibbles are one 32-value group and the high nibbles are the
+          // following group. W4A16 instead packs adjacent logical values in
+          // each byte, so rebuild the 16 output bytes for this group.
+          const int region = group / 2;
+          const int shift = (group & 1) * 4;
+          const uint8_t* qsrc = block + 16 + region * kQ4KValuesPerGroup;
+          uint8_t* qdst = packed + row_block * kW4A16BytesPerBlock + group * (kQ4KValuesPerGroup / 2);
+
+#pragma unroll
+          for (int i = 0; i < kQ4KValuesPerGroup / 2; ++i) {
+            uint8_t q0 = (qsrc[2 * i] >> shift) & 0x0f;
+            uint8_t q1 = (qsrc[2 * i + 1] >> shift) & 0x0f;
+            if (zero_scale) {
+              q0 = 0;
+              q1 = 0;
+            }
+            qdst[i] = q0 | (q1 << 4);
+          }
+        });
+  });
+}
+
+void check_same_device(const torch::Tensor& tensor, const torch::Tensor& raw, const char* name) {
+  TORCH_CHECK(tensor.device() == raw.device(), name, " must be on the same device as raw_qweight");
+}
+
+}  // namespace
+
+SGL_KERNEL_EXPORT void gguf_q4_k_repack(
+    const torch::Tensor& raw_qweight, torch::Tensor& packed_qweight, torch::Tensor& scales, torch::Tensor& zeros) {
+  CHECK_INPUT(raw_qweight);
+  CHECK_INPUT(packed_qweight);
+  CHECK_INPUT(scales);
+  CHECK_INPUT(zeros);
+  check_same_device(packed_qweight, raw_qweight, "packed_qweight");
+  check_same_device(scales, raw_qweight, "scales");
+  check_same_device(zeros, raw_qweight, "zeros");
+
+  TORCH_CHECK(raw_qweight.scalar_type() == at::kByte, "raw_qweight must be uint8");
+  TORCH_CHECK(packed_qweight.scalar_type() == at::kByte, "packed_qweight must be uint8");
+  TORCH_CHECK(raw_qweight.dim() == 2, "raw_qweight must be rank 2 [N, blocks * 144]");
+  TORCH_CHECK(packed_qweight.dim() == 2, "packed_qweight must be rank 2 [N, blocks * 128]");
+  TORCH_CHECK(scales.dim() == 2, "scales must be rank 2 [N, blocks * 8]");
+  TORCH_CHECK(zeros.dim() == 2, "zeros must be rank 2 [N, blocks * 8]");
+  TORCH_CHECK(
+      raw_qweight.size(1) > 0 && raw_qweight.size(1) % kQ4KBytesPerBlock == 0,
+      "raw_qweight width must be a non-zero multiple of 144");
+
+  const int64_t rows = raw_qweight.size(0);
+  TORCH_CHECK(rows > 0, "raw_qweight must contain at least one row");
+  const int64_t blocks_per_row = raw_qweight.size(1) / kQ4KBytesPerBlock;
+  TORCH_CHECK(
+      packed_qweight.size(0) == rows && packed_qweight.size(1) == blocks_per_row * kW4A16BytesPerBlock,
+      "packed_qweight shape must be [N, blocks * 128]");
+  TORCH_CHECK(
+      scales.size(0) == rows && scales.size(1) == blocks_per_row * kQ4KGroupsPerBlock,
+      "scales shape must be [N, blocks * 8]");
+  TORCH_CHECK(zeros.sizes() == scales.sizes(), "zeros shape must match scales shape");
+  TORCH_CHECK(zeros.scalar_type() == scales.scalar_type(), "zeros dtype must match scales dtype");
+  TORCH_CHECK(
+      scales.scalar_type() == at::kBFloat16 || scales.scalar_type() == at::kHalf || scales.scalar_type() == at::kFloat,
+      "scales and zeros must be bfloat16, float16, or float32");
+
+  c10::DeviceGuard device_guard(raw_qweight.device());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+  if (scales.scalar_type() == at::kBFloat16) {
+    launch_q4_k_repack(
+        queue,
+        raw_qweight.data_ptr<uint8_t>(),
+        packed_qweight.data_ptr<uint8_t>(),
+        reinterpret_cast<sycl::ext::oneapi::bfloat16*>(scales.data_ptr()),
+        reinterpret_cast<sycl::ext::oneapi::bfloat16*>(zeros.data_ptr()),
+        rows,
+        blocks_per_row);
+  } else if (scales.scalar_type() == at::kHalf) {
+    launch_q4_k_repack(
+        queue,
+        raw_qweight.data_ptr<uint8_t>(),
+        packed_qweight.data_ptr<uint8_t>(),
+        reinterpret_cast<sycl::half*>(scales.data_ptr()),
+        reinterpret_cast<sycl::half*>(zeros.data_ptr()),
+        rows,
+        blocks_per_row);
+  } else {
+    launch_q4_k_repack(
+        queue,
+        raw_qweight.data_ptr<uint8_t>(),
+        packed_qweight.data_ptr<uint8_t>(),
+        scales.data_ptr<float>(),
+        zeros.data_ptr<float>(),
+        rows,
+        blocks_per_row);
+  }
+}
