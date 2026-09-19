@@ -35,6 +35,8 @@ constexpr int kW4A16BytesPerBlock = kQ4KValuesPerBlock / 2;
 template <typename ScaleT>
 class GGUFQ4KRepackKernel;
 
+class GGUFQ4KPrepareKernel;
+
 inline int64_t round_up(int64_t value, int64_t multiple) {
   return (value + multiple - 1) / multiple * multiple;
 }
@@ -115,6 +117,41 @@ void launch_q4_k_repack(
   });
 }
 
+void launch_q4_k_prepare(
+    sycl::queue& queue, const uint8_t* raw, uint8_t* packed, uint8_t* metadata, int64_t rows, int64_t blocks_per_row) {
+  const int64_t group_count = rows * blocks_per_row * kQ4KGroupsPerBlock;
+  constexpr int64_t kLocalSize = 256;
+  const int64_t global_size = round_up(group_count, kLocalSize);
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<GGUFQ4KPrepareKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), [=](sycl::nd_item<1> item) {
+          const int64_t linear_group = item.get_global_linear_id();
+          if (linear_group >= group_count) {
+            return;
+          }
+
+          const int group = linear_group % kQ4KGroupsPerBlock;
+          const int64_t row_block = linear_group / kQ4KGroupsPerBlock;
+          const uint8_t* block = raw + row_block * kQ4KBytesPerBlock;
+          uint8_t* mdst = metadata + row_block * 16 + group * 2;
+          mdst[0] = block[group * 2];
+          mdst[1] = block[group * 2 + 1];
+
+          const int region = group / 2;
+          const int shift = (group & 1) * 4;
+          const uint8_t* qsrc = block + 16 + region * kQ4KValuesPerGroup;
+          uint8_t* qdst = packed + row_block * kW4A16BytesPerBlock + group * (kQ4KValuesPerGroup / 2);
+#pragma unroll
+          for (int i = 0; i < kQ4KValuesPerGroup / 2; ++i) {
+            const uint8_t q0 = (qsrc[2 * i] >> shift) & 0x0f;
+            const uint8_t q1 = (qsrc[2 * i + 1] >> shift) & 0x0f;
+            qdst[i] = q0 | (q1 << 4);
+          }
+        });
+  });
+}
+
 void check_same_device(const torch::Tensor& tensor, const torch::Tensor& raw, const char* name) {
   TORCH_CHECK(tensor.device() == raw.device(), name, " must be on the same device as raw_qweight");
 }
@@ -188,4 +225,43 @@ SGL_KERNEL_EXPORT void gguf_q4_k_repack(
         rows,
         blocks_per_row);
   }
+}
+
+SGL_KERNEL_EXPORT void
+gguf_q4_k_prepare(const torch::Tensor& raw_qweight, torch::Tensor& packed_qweight, torch::Tensor& metadata) {
+  CHECK_INPUT(raw_qweight);
+  CHECK_INPUT(packed_qweight);
+  CHECK_INPUT(metadata);
+  check_same_device(packed_qweight, raw_qweight, "packed_qweight");
+  check_same_device(metadata, raw_qweight, "metadata");
+
+  TORCH_CHECK(raw_qweight.scalar_type() == at::kByte, "raw_qweight must be uint8");
+  TORCH_CHECK(packed_qweight.scalar_type() == at::kByte, "packed_qweight must be uint8");
+  TORCH_CHECK(metadata.scalar_type() == at::kByte, "metadata must be uint8");
+  TORCH_CHECK(raw_qweight.dim() == 2, "raw_qweight must be rank 2 [N, blocks * 144]");
+  TORCH_CHECK(packed_qweight.dim() == 2, "packed_qweight must be rank 2 [N, blocks * 128]");
+  TORCH_CHECK(metadata.dim() == 2, "metadata must be rank 2 [N, blocks * 16]");
+  TORCH_CHECK(raw_qweight.size(0) > 0, "raw_qweight must contain at least one row");
+  TORCH_CHECK(
+      raw_qweight.size(1) > 0 && raw_qweight.size(1) % kQ4KBytesPerBlock == 0,
+      "raw_qweight width must be a non-zero multiple of 144");
+
+  const int64_t rows = raw_qweight.size(0);
+  const int64_t blocks_per_row = raw_qweight.size(1) / kQ4KBytesPerBlock;
+  TORCH_CHECK(
+      packed_qweight.size(0) == rows && packed_qweight.size(1) == blocks_per_row * kW4A16BytesPerBlock,
+      "packed_qweight shape must be [N, blocks * 128]");
+  TORCH_CHECK(
+      metadata.size(0) == rows && metadata.size(1) == blocks_per_row * 16, "metadata shape must be [N, blocks * 16]");
+
+  c10::DeviceGuard device_guard(raw_qweight.device());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+  launch_q4_k_prepare(
+      queue,
+      raw_qweight.data_ptr<uint8_t>(),
+      packed_qweight.data_ptr<uint8_t>(),
+      metadata.data_ptr<uint8_t>(),
+      rows,
+      blocks_per_row);
 }

@@ -64,6 +64,7 @@ template <
     char LayoutKindB,
     char LayoutKindD,
     bool HasZero,
+    bool CompactQ4K,
     int StealChunk,
     int PrefetchDist,
     bool MainloopBarrier,
@@ -80,6 +81,7 @@ CUTE_DEVICE void MoEGEMM(
     const ElementB* Weights,
     const ElementS* Scales,
     const ElementS* Zeros,
+    const uint8_t* Q4KMetadata,
     const ElementBI* Bias,
     ElementD* Outputs,
     TiledMMA const& mma,
@@ -149,9 +151,15 @@ CUTE_DEVICE void MoEGEMM(
     ElementA* ptr_A_curr_batch = const_cast<ElementA*>(Activations) + pre_rows * gemm_k;
     ElementB* ptr_B_curr_batch = const_cast<ElementB*>(Weights) + B_offset;
     ElementD* ptr_D_curr_batch = Outputs + pre_rows * gemm_n;
-    ElementS* ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + expert_id;
+    ElementS* ptr_Scales_curr_batch = nullptr;
     ElementS* ptr_Zeros_curr_batch = nullptr;
-    if constexpr (is_B_4bits) {
+    const uint8_t* ptr_Q4KMetadata_curr_batch = nullptr;
+    if constexpr (!CompactQ4K) {
+      ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + expert_id;
+    }
+    if constexpr (CompactQ4K) {
+      ptr_Q4KMetadata_curr_batch = Q4KMetadata + static_cast<int64_t>(expert_id) * gemm_n * (gemm_k / 256) * 16;
+    } else if constexpr (is_B_4bits) {
       ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
       if constexpr (HasZero) {
         ptr_Zeros_curr_batch = const_cast<ElementS*>(Zeros) + B_offset * 2 / group_size;
@@ -185,7 +193,7 @@ CUTE_DEVICE void MoEGEMM(
     auto A_tensor = make_moe_tensor<ElementA, LayoutKindA>(ptr_A_curr_batch, a_rows, gemm_k);
     auto B_tensor = [&]() {
       if constexpr (is_B_int4) {
-        if constexpr (HasZero) {
+        if constexpr (HasZero || CompactQ4K) {
           return make_moe_tensor<uint4_t, actual_layout_of_B>(
               reinterpret_cast<uint4_t*>(ptr_B_curr_batch), b_rows, gemm_k);
         } else {
@@ -214,6 +222,7 @@ CUTE_DEVICE void MoEGEMM(
       GmemTiledCopyD,                   \
       GroupSize,                        \
       HasZero,                          \
+      CompactQ4K,                       \
       PrefetchDist,                     \
       MainloopBarrier,                  \
       SkipPaddedN>(                     \
@@ -221,11 +230,14 @@ CUTE_DEVICE void MoEGEMM(
       B_tensor,                         \
       ptr_Scales_curr_batch,            \
       ptr_Zeros_curr_batch,             \
+      ptr_Q4KMetadata_curr_batch,       \
       ptr_Bias_curr_batch,              \
       D_tensor,                         \
       tile_coord,                       \
       mma);
-        if (group_size == 32) {
+        if constexpr (CompactQ4K) {
+          XE_GEMM_4BITS_CALLER(32)
+        } else if (group_size == 32) {
           XE_GEMM_4BITS_CALLER(32)
         } else if (group_size == 64) {
           XE_GEMM_4BITS_CALLER(64)

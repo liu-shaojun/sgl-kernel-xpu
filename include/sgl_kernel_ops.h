@@ -753,12 +753,23 @@ void moe_grouped_mm_nt_xe20_w4a16(
     bool is_int4,
     const int64_t group_size);
 
+// Direct Q4_K grouped GEMM. Values are adjacent-nibble uint4 [E, N, K/2];
+// metadata retains the compact 16-byte GGUF header per 256 values.
+void gguf_q4_k_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& metadata,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts);
+
 // Convert raw GGUF Q4_K super-blocks [N, blocks * 144] into the adjacent-
 // nibble W4A16 representation consumed by moe_grouped_mm_nt_xe20_w4a16.
 // The caller allocates packed_qweight [N, blocks * 128] and scales/zeros
 // [N, blocks * 8]. scales and zeros may be bf16, fp16, or fp32.
 void gguf_q4_k_repack(
     const torch::Tensor& raw_qweight, torch::Tensor& packed_qweight, torch::Tensor& scales, torch::Tensor& zeros);
+void gguf_q4_k_prepare(const torch::Tensor& raw_qweight, torch::Tensor& packed_qweight, torch::Tensor& metadata);
 
 // FP8 weight-only MoE grouped GEMM. Activations are BF16, weights are FP8
 // E4M3, and weight_scales is [E, 1]/[E, 2] for per-expert scalar scales or

@@ -109,7 +109,11 @@ from sgl_kernel.gemm import (
     sgl_per_token_quant_fp8,
 )
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
-from sgl_kernel.gguf import gguf_q4_k_repack
+from sgl_kernel.gguf import (
+    gguf_q4_k_grouped_mm,
+    gguf_q4_k_prepare,
+    gguf_q4_k_repack,
+)
 from sgl_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
