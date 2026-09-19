@@ -163,6 +163,8 @@ if(USE_MOE)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW8A16Xe20.cmake)
     endif()
+    # Compact GGUF Q4_K is AOT-only for now, including in runtime-JIT builds.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ4KXe20.cmake)
 endif()
 
 

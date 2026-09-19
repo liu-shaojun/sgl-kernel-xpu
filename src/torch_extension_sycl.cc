@@ -224,6 +224,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   // GGUF preparation kernels are independent of the optional MoE build.
   m.def("gguf_q4_k_repack(Tensor raw_qweight, Tensor! packed_qweight, Tensor! scales, Tensor! zeros) -> ()");
   m.impl("gguf_q4_k_repack", torch::kXPU, &gguf_q4_k_repack);
+  m.def("gguf_q4_k_prepare(Tensor raw_qweight, Tensor! packed_qweight, Tensor! metadata) -> ()");
+  m.impl("gguf_q4_k_prepare", torch::kXPU, &gguf_q4_k_prepare);
 
 #ifdef USE_MOE
   m.def(
@@ -255,6 +257,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "moe_grouped_mm_nt_xe20_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
       "Tensor? zeros, Tensor? bias, Tensor rows_per_expert, int n_experts, bool is_int4, int group_size) -> ()");
   m.impl("moe_grouped_mm_nt_xe20_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w4a16);
+  m.def(
+      "gguf_q4_k_grouped_mm(Tensor! output, Tensor activations, Tensor packed_weights, Tensor metadata, "
+      "Tensor rows_per_expert, int n_experts) -> ()");
+  m.impl("gguf_q4_k_grouped_mm", torch::kXPU, &gguf_q4_k_grouped_mm);
 
   m.def(
       "moe_grouped_mm_nt_xe20_fp8_w8a16(Tensor! output, Tensor activations, Tensor weights, "

@@ -63,6 +63,20 @@ void w4a16_launch(
     const int num_experts,
     const int group_size,
     int32_t* atomic_buffer);
+
+template <typename Policy, typename ElementA>
+void q4k_launch(
+    sycl::queue stream,
+    const void* activations,
+    const void* packed_weights,
+    const void* metadata,
+    void* outputs,
+    const int gemm_n,
+    const int gemm_k,
+    const int* rows_per_expert,
+    const int total_rows,
+    const int num_experts,
+    int32_t* atomic_buffer);
 }  // namespace moe_w4a16
 
 #define DECLARE_W4A16_EXTERN(Policy, ElementS, ElementA)                               \
@@ -98,6 +112,35 @@ DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256_skip)
 
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
+
+#define DECLARE_Q4K_EXTERN(Policy, ElementA)                               \
+  extern template void moe_w4a16::q4k_launch<moe_w4a16::Policy, ElementA>( \
+      sycl::queue,                                                         \
+      const void*,                                                         \
+      const void*,                                                         \
+      const void*,                                                         \
+      void*,                                                               \
+      const int,                                                           \
+      const int,                                                           \
+      const int*,                                                          \
+      const int,                                                           \
+      const int,                                                           \
+      int32_t*);
+
+#define DECLARE_Q4K_POLICY(Policy)                \
+  DECLARE_Q4K_EXTERN(Policy, cutlass::bfloat16_t) \
+  DECLARE_Q4K_EXTERN(Policy, cutlass::half_t)
+
+DECLARE_Q4K_POLICY(w4a16_launch_policy_m_8_n_64)
+DECLARE_Q4K_POLICY(w4a16_launch_policy_m_16_n_64)
+DECLARE_Q4K_POLICY(w4a16_launch_policy_m_32_n_64)
+DECLARE_Q4K_POLICY(w4a16_launch_policy_m_64_n_128)
+DECLARE_Q4K_POLICY(w4a16_launch_policy_m_64_n_128_skip)
+DECLARE_Q4K_POLICY(w4a16_launch_policy_m_64_n_256)
+DECLARE_Q4K_POLICY(w4a16_launch_policy_m_64_n_256_skip)
+
+#undef DECLARE_Q4K_POLICY
+#undef DECLARE_Q4K_EXTERN
 
 namespace {
 
@@ -393,6 +436,116 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
 
 #undef DISPATCH_W4A16_POLICY
 #undef LAUNCH_W4A16
+}
+
+SGL_KERNEL_EXPORT void gguf_q4_k_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& packed_weights,
+    const torch::Tensor& metadata,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts) {
+  CHECK_INPUT(output);
+  CHECK_INPUT(activations);
+  CHECK_INPUT(packed_weights);
+  CHECK_INPUT(metadata);
+  CHECK_INPUT(rows_per_expert);
+  TORCH_CHECK(output.device() == activations.device(), "output must be on the same device as activations");
+  TORCH_CHECK(
+      packed_weights.device() == activations.device(), "packed_weights must be on the same device as activations");
+  TORCH_CHECK(metadata.device() == activations.device(), "metadata must be on the same device as activations");
+  TORCH_CHECK(
+      rows_per_expert.device() == activations.device(), "rows_per_expert must be on the same device as activations");
+
+  TORCH_CHECK(output.dim() == 2, "output must be 2D [total_m, N]");
+  TORCH_CHECK(activations.dim() == 2, "activations must be 2D [total_m, K]");
+  TORCH_CHECK(packed_weights.dim() == 3, "packed_weights must be 3D [E, N, K/2]");
+  TORCH_CHECK(metadata.dim() == 3, "metadata must be 3D [E, N, K/16]");
+  TORCH_CHECK(rows_per_expert.dim() == 1, "rows_per_expert must be 1D [E]");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
+
+  const int total_m = activations.size(0);
+  const int gemm_k = activations.size(1);
+  const int gemm_n = packed_weights.size(1);
+  TORCH_CHECK(gemm_k > 0 && gemm_k % 256 == 0, "K must be a positive multiple of 256");
+  TORCH_CHECK(gemm_n > 0 && gemm_n % 8 == 0, "N must be a positive multiple of 8");
+  TORCH_CHECK(packed_weights.size(0) == n_experts, "packed_weights.size(0) must equal n_experts");
+  TORCH_CHECK(packed_weights.size(2) == gemm_k / 2, "packed_weights.size(2) must equal K/2");
+  TORCH_CHECK(packed_weights.scalar_type() == at::kByte, "packed_weights must be uint8");
+  TORCH_CHECK(
+      metadata.size(0) == n_experts && metadata.size(1) == gemm_n && metadata.size(2) == gemm_k / 16,
+      "metadata shape must be [E, N, K/16]");
+  TORCH_CHECK(metadata.scalar_type() == at::kByte, "metadata must be uint8");
+  TORCH_CHECK(rows_per_expert.size(0) == n_experts, "rows_per_expert must have n_experts elements");
+  TORCH_CHECK(rows_per_expert.scalar_type() == at::kInt, "rows_per_expert must be int32");
+  TORCH_CHECK(output.size(0) == total_m && output.size(1) == gemm_n, "output shape must be [total_m, N]");
+  TORCH_CHECK(
+      activations.scalar_type() == at::kBFloat16 || activations.scalar_type() == at::kHalf,
+      "activations must be bfloat16 or float16");
+  TORCH_CHECK(output.scalar_type() == activations.scalar_type(), "output dtype must match activations dtype");
+
+  c10::DeviceGuard device_guard(activations.device());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+  at::Tensor& atomic_buffer = w4a16_atomic_counter(activations.options(), stream);
+  const int avg_m = total_m / static_cast<int>(n_experts);
+  const int policy_id = select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
+
+#define LAUNCH_Q4K(Policy)                                           \
+  do {                                                               \
+    if (activations.scalar_type() == at::kHalf) {                    \
+      moe_w4a16::q4k_launch<moe_w4a16::Policy, cutlass::half_t>(     \
+          queue,                                                     \
+          activations.data_ptr(),                                    \
+          packed_weights.data_ptr(),                                 \
+          metadata.data_ptr(),                                       \
+          output.data_ptr(),                                         \
+          gemm_n,                                                    \
+          gemm_k,                                                    \
+          rows_per_expert.data_ptr<int>(),                           \
+          total_m,                                                   \
+          static_cast<int>(n_experts),                               \
+          atomic_buffer.data_ptr<int>());                            \
+    } else {                                                         \
+      moe_w4a16::q4k_launch<moe_w4a16::Policy, cutlass::bfloat16_t>( \
+          queue,                                                     \
+          activations.data_ptr(),                                    \
+          packed_weights.data_ptr(),                                 \
+          metadata.data_ptr(),                                       \
+          output.data_ptr(),                                         \
+          gemm_n,                                                    \
+          gemm_k,                                                    \
+          rows_per_expert.data_ptr<int>(),                           \
+          total_m,                                                   \
+          static_cast<int>(n_experts),                               \
+          atomic_buffer.data_ptr<int>());                            \
+    }                                                                \
+  } while (0)
+
+  switch (policy_id) {
+    case 0:
+      LAUNCH_Q4K(w4a16_launch_policy_m_8_n_64);
+      break;
+    case 1:
+      LAUNCH_Q4K(w4a16_launch_policy_m_16_n_64);
+      break;
+    case 2:
+      LAUNCH_Q4K(w4a16_launch_policy_m_32_n_64);
+      break;
+    case 3:
+      LAUNCH_Q4K(w4a16_launch_policy_m_64_n_128);
+      break;
+    case 4:
+      LAUNCH_Q4K(w4a16_launch_policy_m_64_n_128_skip);
+      break;
+    case 5:
+      LAUNCH_Q4K(w4a16_launch_policy_m_64_n_256);
+      break;
+    case 6:
+      LAUNCH_Q4K(w4a16_launch_policy_m_64_n_256_skip);
+      break;
+  }
+#undef LAUNCH_Q4K
 }
 
 #undef SYCL_INTEL_TARGET
