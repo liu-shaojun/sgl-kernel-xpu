@@ -221,6 +221,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers) -> ()");
   m.impl("transfer_kv_mamba_lf_pf", torch::kXPU, &transfer_kv_mamba_lf_pf);
 
+  // GGUF preparation kernels are independent of the optional MoE build.
+  m.def("gguf_q4_k_repack(Tensor raw_qweight, Tensor! packed_qweight, Tensor! scales, Tensor! zeros) -> ()");
+  m.impl("gguf_q4_k_repack", torch::kXPU, &gguf_q4_k_repack);
+
 #ifdef USE_MOE
   m.def(
       "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "
