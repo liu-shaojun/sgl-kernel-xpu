@@ -65,6 +65,7 @@ template <
     char LayoutKindD,
     bool HasZero,
     bool CompactQ4K,
+    bool AffineMinimum,
     int StealChunk,
     int PrefetchDist,
     bool MainloopBarrier,
@@ -166,7 +167,7 @@ CUTE_DEVICE void MoEGEMM(
       constexpr int values_per_storage = is_B_4bits ? 2 : 1;
       ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + B_offset * values_per_storage / group_size;
       if constexpr (HasZero) {
-        ptr_Zeros_curr_batch = const_cast<ElementS*>(Zeros) + B_offset * 2 / group_size;
+        ptr_Zeros_curr_batch = const_cast<ElementS*>(Zeros) + B_offset * values_per_storage / group_size;
       }
     }
     ElementBI* ptr_Bias_curr_batch = nullptr;
@@ -227,6 +228,7 @@ CUTE_DEVICE void MoEGEMM(
       GroupSize,                            \
       HasZero,                              \
       CompactQ4K,                           \
+      AffineMinimum,                        \
       PrefetchDist,                         \
       MainloopBarrier,                      \
       SkipPaddedN>(                         \

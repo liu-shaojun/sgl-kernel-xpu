@@ -69,6 +69,7 @@ void q4k_launch(
               'R',
               false,
               true,
+              false,
               Policy::StealChunk,
               Policy::PrefetchDist,
               Policy::MainloopBarrier,

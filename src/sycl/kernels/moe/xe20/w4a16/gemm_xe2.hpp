@@ -72,6 +72,7 @@ template <
     int GroupSize,
     bool HasZero,
     bool CompactQ4K,
+    bool AffineMinimum,
     int PrefetchDist,
     bool MainloopBarrier,
     bool SkipPaddedN,
@@ -99,6 +100,9 @@ CUTE_DEVICE void xe_gemm_quantized(
           std::is_same_v<TB, int8_t>,
       "quantized GEMM supports INT4, MXFP4, compact Q4_K, and signed INT8 weights");
   static_assert(!CompactQ4K || (GroupSize == 32 && !HasZero), "compact Q4_K uses 32-value groups without zero points");
+  static_assert(
+      !AffineMinimum || (HasZero && std::is_same_v<TB, int8_t> && GroupSize == 32),
+      "affine minimums are supported only for group-32 INT8 weights");
   static constexpr int sg_local_range = 16;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_m = get<0>(blk_coord);
@@ -189,6 +193,7 @@ CUTE_DEVICE void xe_gemm_quantized(
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
   scaleStoreType scales[thr_N * channel_num * kScaleGroupsPerTile];
   conditional_t<HasZero, TA, uint8_t> zeros[thr_N * channel_num];
+  scaleStoreType minimums[AffineMinimum ? thr_N * channel_num : 1];
   float q4k_scales[CompactQ4K ? thr_N * channel_num : 1];
   float q4k_minimums[CompactQ4K ? thr_N * channel_num : 1];
   float q4k_d[CompactQ4K ? thr_N * channel_num : 1];
@@ -444,6 +449,9 @@ CUTE_DEVICE void xe_gemm_quantized(
               }
 
               scales[slot * kScaleGroupsPerTile + scale_group] = scale;
+              if constexpr (AffineMinimum) {
+                minimums[slot] = static_cast<scaleStoreType>(zp[0]);
+              }
               if constexpr (kFuseDequant) {
                 mul_pairs[n][c] = scale;
               }
@@ -476,6 +484,11 @@ CUTE_DEVICE void xe_gemm_quantized(
             const int slot = n * channel_num + c;
             const float value = static_cast<float>(tCrB(cute::tuple(c, _), n, _)[i]);
             tCrB(cute::tuple(c, _), n, _)[i] = static_cast<TA>(value * q4k_scales[slot] - q4k_minimums[slot]);
+          } else if constexpr (AffineMinimum) {
+            const int slot = n * channel_num + c;
+            const auto scale = scales[slot];
+            const float value = static_cast<float>(tCrB(cute::tuple(c, _), n, _)[i]);
+            tCrB(cute::tuple(c, _), n, _)[i] = static_cast<TA>(value * scale - minimums[slot]);
           } else if constexpr (HasZero) {
             TA value = tCrB(cute::tuple(c, _), n, _)[i] - zeros[n * channel_num + c];
             if constexpr (std::is_same_v<TA, half_t>) {

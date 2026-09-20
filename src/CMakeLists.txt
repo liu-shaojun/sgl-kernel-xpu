@@ -169,6 +169,8 @@ if(USE_MOE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ80Xe20.cmake)
     # Q6_K uses signed INT8 DPAS with one scale per 16-value quantization group.
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ6KXe20.cmake)
+    # Q5_K uses unsigned code values in INT8 DPAS plus an affine minimum.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ5KXe20.cmake)
 endif()
 
 

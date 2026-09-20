@@ -87,6 +87,7 @@ void MoEGEMMLauncher(
                     'R',
                     HasZero,
                     false,
+                    false,
                     policy::StealChunk,
                     policy::PrefetchDist,
                     policy::MainloopBarrier,

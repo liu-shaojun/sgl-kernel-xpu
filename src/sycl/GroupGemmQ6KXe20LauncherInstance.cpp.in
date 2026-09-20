@@ -69,6 +69,7 @@ void q6_k_launch(
               'R',
               false,
               false,
+              false,
               Policy::StealChunk,
               Policy::PrefetchDist,
               Policy::MainloopBarrier,

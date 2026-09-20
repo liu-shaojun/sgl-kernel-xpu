@@ -13,6 +13,9 @@ Q8_0_VALUES_PER_BLOCK = 32
 Q6_K_BLOCK_BYTES = 210
 Q6_K_VALUES_PER_BLOCK = 256
 Q6_K_GROUP_SIZE = 16
+Q5_K_BLOCK_BYTES = 176
+Q5_K_VALUES_PER_BLOCK = 256
+Q5_K_GROUP_SIZE = 32
 
 
 def gguf_q4_k_grouped_mm(
@@ -198,6 +201,57 @@ def gguf_q6_k_grouped_mm(
     return output
 
 
+def gguf_q5_k_prepare(
+    raw_qweight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare Q5_K code values, FP16 scales, and FP16 minimums."""
+    _validate_q5_k(raw_qweight)
+    rows = raw_qweight.shape[0]
+    blocks = raw_qweight.shape[1] // Q5_K_BLOCK_BYTES
+    weights = torch.empty(
+        (rows, blocks * Q5_K_VALUES_PER_BLOCK),
+        dtype=torch.int8,
+        device=raw_qweight.device,
+    )
+    metadata_shape = (
+        rows,
+        blocks * (Q5_K_VALUES_PER_BLOCK // Q5_K_GROUP_SIZE),
+    )
+    scales = torch.empty(metadata_shape, dtype=torch.float16, device=raw_qweight.device)
+    minimums = torch.empty_like(scales)
+    torch.ops.sgl_kernel.gguf_q5_k_prepare(raw_qweight, weights, scales, minimums)
+    return weights, scales, minimums
+
+
+def gguf_q5_k_grouped_mm(
+    activations: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    minimums: torch.Tensor,
+    rows_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Multiply activations by prepared affine Q5_K expert weights."""
+    if activations.ndim != 2:
+        raise ValueError("activations must be rank 2 [total_m, K]")
+    if weights.ndim != 3:
+        raise ValueError("weights must be rank 3 [E, N, K]")
+    output = torch.empty(
+        (activations.shape[0], weights.shape[1]),
+        dtype=activations.dtype,
+        device=activations.device,
+    )
+    torch.ops.sgl_kernel.gguf_q5_k_grouped_mm(
+        output,
+        activations,
+        weights,
+        scales,
+        minimums,
+        rows_per_expert,
+        weights.shape[0],
+    )
+    return output
+
+
 def _validate_q4_k(raw_qweight: torch.Tensor) -> None:
     """Validate the common raw Q4_K matrix contract."""
     if raw_qweight.dtype != torch.uint8:
@@ -243,6 +297,21 @@ def _validate_q6_k(raw_qweight: torch.Tensor) -> None:
         )
 
 
+def _validate_q5_k(raw_qweight: torch.Tensor) -> None:
+    """Validate the common raw Q5_K matrix contract."""
+    if raw_qweight.dtype != torch.uint8:
+        raise TypeError(f"raw_qweight must be uint8, got {raw_qweight.dtype}")
+    if raw_qweight.ndim != 2:
+        raise ValueError(f"raw_qweight must be rank 2, got {raw_qweight.ndim}")
+    if raw_qweight.shape[0] == 0:
+        raise ValueError("raw_qweight must contain at least one row")
+    if raw_qweight.shape[1] == 0 or raw_qweight.shape[1] % Q5_K_BLOCK_BYTES:
+        raise ValueError(
+            "raw_qweight width must be a non-zero multiple of "
+            f"{Q5_K_BLOCK_BYTES}, got {raw_qweight.shape[1]}"
+        )
+
+
 __all__ = [
     "Q4_K_BLOCK_BYTES",
     "Q4_K_GROUP_SIZE",
@@ -253,6 +322,9 @@ __all__ = [
     "Q6_K_BLOCK_BYTES",
     "Q6_K_GROUP_SIZE",
     "Q6_K_VALUES_PER_BLOCK",
+    "Q5_K_BLOCK_BYTES",
+    "Q5_K_GROUP_SIZE",
+    "Q5_K_VALUES_PER_BLOCK",
     "gguf_q4_k_grouped_mm",
     "gguf_q4_k_prepare",
     "gguf_q4_k_repack",
@@ -260,4 +332,6 @@ __all__ = [
     "gguf_q8_0_prepare",
     "gguf_q6_k_grouped_mm",
     "gguf_q6_k_prepare",
+    "gguf_q5_k_grouped_mm",
+    "gguf_q5_k_prepare",
 ]
