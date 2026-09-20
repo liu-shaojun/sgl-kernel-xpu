@@ -897,14 +897,16 @@ SGL_KERNEL_EXPORT void gguf_q6_k_grouped_mm(
 #undef LAUNCH_Q6K
 }
 
-SGL_KERNEL_EXPORT void gguf_q5_k_grouped_mm(
+void gguf_q5_affine_grouped_mm_impl(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
     const torch::Tensor& scales,
     const torch::Tensor& minimums,
     const torch::Tensor& rows_per_expert,
-    const int64_t n_experts) {
+    const int64_t n_experts,
+    const int64_t k_multiple,
+    const char* k_error) {
   CHECK_INPUT(output);
   CHECK_INPUT(activations);
   CHECK_INPUT(weights);
@@ -929,7 +931,7 @@ SGL_KERNEL_EXPORT void gguf_q5_k_grouped_mm(
   const int total_m = activations.size(0);
   const int gemm_k = activations.size(1);
   const int gemm_n = weights.size(1);
-  TORCH_CHECK(gemm_k > 0 && gemm_k % 256 == 0, "K must be a positive multiple of the 256-value Q5_K block");
+  TORCH_CHECK(gemm_k > 0 && gemm_k % k_multiple == 0, k_error);
   TORCH_CHECK(gemm_n > 0 && gemm_n % 8 == 0, "N must be a positive multiple of 8");
   TORCH_CHECK(weights.size(0) == n_experts, "weights.size(0) must equal n_experts");
   TORCH_CHECK(weights.size(2) == gemm_k, "weights.size(2) must equal K");
@@ -1012,6 +1014,46 @@ SGL_KERNEL_EXPORT void gguf_q5_k_grouped_mm(
       break;
   }
 #undef LAUNCH_Q5K
+}
+
+SGL_KERNEL_EXPORT void gguf_q5_k_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& scales,
+    const torch::Tensor& minimums,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts) {
+  gguf_q5_affine_grouped_mm_impl(
+      output,
+      activations,
+      weights,
+      scales,
+      minimums,
+      rows_per_expert,
+      n_experts,
+      256,
+      "K must be a positive multiple of the 256-value Q5_K block");
+}
+
+SGL_KERNEL_EXPORT void gguf_q5_1_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& scales,
+    const torch::Tensor& minimums,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts) {
+  gguf_q5_affine_grouped_mm_impl(
+      output,
+      activations,
+      weights,
+      scales,
+      minimums,
+      rows_per_expert,
+      n_experts,
+      32,
+      "K must be a positive multiple of the 32-value Q5_1 block");
 }
 
 #undef SYCL_INTEL_TARGET

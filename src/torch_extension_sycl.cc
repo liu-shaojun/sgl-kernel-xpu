@@ -289,6 +289,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "gguf_q5_k_grouped_mm(Tensor! output, Tensor activations, Tensor weights, Tensor scales, Tensor minimums, "
       "Tensor rows_per_expert, int n_experts) -> ()");
   m.impl("gguf_q5_k_grouped_mm", torch::kXPU, &gguf_q5_k_grouped_mm);
+  m.def(
+      "gguf_q5_1_grouped_mm(Tensor! output, Tensor activations, Tensor weights, Tensor scales, Tensor minimums, "
+      "Tensor rows_per_expert, int n_experts) -> ()");
+  m.impl("gguf_q5_1_grouped_mm", torch::kXPU, &gguf_q5_1_grouped_mm);
 
   m.def(
       "moe_grouped_mm_nt_xe20_fp8_w8a16(Tensor! output, Tensor activations, Tensor weights, "

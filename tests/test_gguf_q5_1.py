@@ -2,7 +2,7 @@ import pytest
 import torch
 from gguf import GGMLQuantizationType, dequantize
 
-from sgl_kernel import gguf_q5_1_prepare, gguf_q5_k_grouped_mm
+from sgl_kernel import gguf_q5_1_grouped_mm, gguf_q5_1_prepare
 
 pytestmark = pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU required")
 
@@ -89,13 +89,14 @@ def test_q5_1_prepared_values_match_gguf_reference():
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("m", [1, 17, 65, 257])
-def test_q5_1_grouped_mm_matches_reference(dtype, m):
-    n, k = 64, 256
+@pytest.mark.parametrize("k", [256, 704])
+def test_q5_1_grouped_mm_matches_reference(dtype, m, k):
+    n = 64
     raw = _make_raw_q5_1(n, k // 32)
     weights, scales, minimums = gguf_q5_1_prepare(raw.to("xpu"))
     activations = torch.randn(m, k, dtype=dtype, device="xpu") * 0.1
     rows = torch.tensor([m], dtype=torch.int32, device="xpu")
-    actual = gguf_q5_k_grouped_mm(
+    actual = gguf_q5_1_grouped_mm(
         activations,
         weights.reshape(1, n, k),
         scales.reshape(1, n, k // 32),

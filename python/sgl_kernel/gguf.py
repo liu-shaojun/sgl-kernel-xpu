@@ -267,6 +267,35 @@ def gguf_q5_k_grouped_mm(
     return output
 
 
+def gguf_q5_1_grouped_mm(
+    activations: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    minimums: torch.Tensor,
+    rows_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Multiply activations by prepared affine Q5_1 expert weights."""
+    if activations.ndim != 2:
+        raise ValueError("activations must be rank 2 [total_m, K]")
+    if weights.ndim != 3:
+        raise ValueError("weights must be rank 3 [E, N, K]")
+    output = torch.empty(
+        (activations.shape[0], weights.shape[1]),
+        dtype=activations.dtype,
+        device=activations.device,
+    )
+    torch.ops.sgl_kernel.gguf_q5_1_grouped_mm(
+        output,
+        activations,
+        weights,
+        scales,
+        minimums,
+        rows_per_expert,
+        weights.shape[0],
+    )
+    return output
+
+
 def gguf_iq4_xs_prepare(
     raw_qweight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -538,6 +567,7 @@ __all__ = [
     "gguf_q6_k_grouped_mm",
     "gguf_q6_k_prepare",
     "gguf_q5_k_grouped_mm",
+    "gguf_q5_1_grouped_mm",
     "gguf_q5_k_prepare",
     "gguf_iq4_xs_prepare",
     "gguf_iq4_nl_prepare",

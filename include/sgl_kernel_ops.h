@@ -820,6 +820,17 @@ void gguf_q5_k_grouped_mm(
     const torch::Tensor& rows_per_expert,
     const int64_t n_experts);
 
+// Direct GGUF Q5_1 grouped GEMM. It shares the affine group-32 DPAS core with
+// Q5_K but accepts any complete 32-value Q5_1 block along K.
+void gguf_q5_1_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& scales,
+    const torch::Tensor& minimums,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts);
+
 // FP8 weight-only MoE grouped GEMM. Activations are BF16, weights are FP8
 // E4M3, and weight_scales is [E, 1]/[E, 2] for per-expert scalar scales or
 // [E, ceil(N/128), K/128] for 128x128 block scales.
