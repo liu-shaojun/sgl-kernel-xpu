@@ -111,6 +111,7 @@ from sgl_kernel.gemm import (
 from sgl_kernel.grammar import apply_token_bitmask_inplace_cuda
 from sgl_kernel.gguf import (
     gguf_iq3_s_prepare,
+    gguf_q5_1_prepare,
     gguf_q4_k_grouped_mm,
     gguf_q4_k_prepare,
     gguf_q4_k_repack,

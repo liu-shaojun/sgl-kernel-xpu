@@ -240,6 +240,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gguf_q3_k_prepare", torch::kXPU, &gguf_q3_k_prepare);
   m.def("gguf_iq3_s_prepare(Tensor raw_qweight, Tensor! weights, Tensor! scales) -> ()");
   m.impl("gguf_iq3_s_prepare", torch::kXPU, &gguf_iq3_s_prepare);
+  m.def("gguf_q5_1_prepare(Tensor raw_qweight, Tensor! weights, Tensor! scales, Tensor! minimums) -> ()");
+  m.impl("gguf_q5_1_prepare", torch::kXPU, &gguf_q5_1_prepare);
 
 #ifdef USE_MOE
   m.def(

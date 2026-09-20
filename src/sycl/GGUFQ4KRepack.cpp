@@ -51,6 +51,8 @@ constexpr int kQ3KGroupsPerBlock = 16;
 constexpr int kIQ3SValuesPerBlock = 256;
 constexpr int kIQ3SBytesPerBlock = 110;
 constexpr int kIQ3SGroupsPerBlock = 8;
+constexpr int kQ51ValuesPerBlock = 32;
+constexpr int kQ51BytesPerBlock = 24;
 constexpr int8_t kIQ4Values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 template <typename ScaleT>
@@ -64,6 +66,7 @@ class GGUFIQ4XSPrepareKernel;
 class GGUFIQ4NLPrepareKernel;
 class GGUFQ3KPrepareKernel;
 class GGUFIQ3SPrepareKernel;
+class GGUFQ51PrepareKernel;
 
 inline int64_t round_up(int64_t value, int64_t multiple) {
   return (value + multiple - 1) / multiple * multiple;
@@ -474,6 +477,45 @@ void launch_iq3_s_prepare(
   });
 }
 
+void launch_q5_1_prepare(
+    sycl::queue& queue,
+    const uint8_t* raw,
+    int8_t* weights,
+    uint16_t* scales,
+    uint16_t* minimums,
+    int64_t rows,
+    int64_t blocks_per_row) {
+  const int64_t block_count = rows * blocks_per_row;
+  constexpr int64_t kLocalSize = 256;
+  const int64_t global_size = round_up(block_count, kLocalSize);
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<GGUFQ51PrepareKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), [=](sycl::nd_item<1> item) {
+          const int64_t block_idx = item.get_global_linear_id();
+          if (block_idx >= block_count) {
+            return;
+          }
+
+          const uint8_t* src = raw + block_idx * kQ51BytesPerBlock;
+          scales[block_idx] = static_cast<uint16_t>(src[0]) | (static_cast<uint16_t>(src[1]) << 8);
+          const uint16_t m_bits = static_cast<uint16_t>(src[2]) | (static_cast<uint16_t>(src[3]) << 8);
+          const sycl::half m = sycl::bit_cast<sycl::half>(m_bits);
+          minimums[block_idx] = sycl::bit_cast<uint16_t>(-m);
+          const uint8_t* qh = src + 4;
+          const uint8_t* qs = src + 8;
+          int8_t* dst = weights + block_idx * kQ51ValuesPerBlock;
+
+#pragma unroll
+          for (int i = 0; i < kQ51ValuesPerBlock; ++i) {
+            const int low4 = (qs[i & 15] >> ((i / 16) * 4)) & 0x0f;
+            const int high1 = (qh[i / 8] >> (i & 7)) & 0x01;
+            dst[i] = static_cast<int8_t>(low4 | (high1 << 4));
+          }
+        });
+  });
+}
+
 void check_same_device(const torch::Tensor& tensor, const torch::Tensor& raw, const char* name) {
   TORCH_CHECK(tensor.device() == raw.device(), name, " must be on the same device as raw_qweight");
 }
@@ -866,6 +908,50 @@ gguf_iq3_s_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, tor
       raw_qweight.data_ptr<uint8_t>(),
       weights.data_ptr<int8_t>(),
       reinterpret_cast<uint16_t*>(scales.data_ptr()),
+      rows,
+      blocks_per_row);
+}
+
+SGL_KERNEL_EXPORT void gguf_q5_1_prepare(
+    const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales, torch::Tensor& minimums) {
+  CHECK_INPUT(raw_qweight);
+  CHECK_INPUT(weights);
+  CHECK_INPUT(scales);
+  CHECK_INPUT(minimums);
+  check_same_device(weights, raw_qweight, "weights");
+  check_same_device(scales, raw_qweight, "scales");
+  check_same_device(minimums, raw_qweight, "minimums");
+
+  TORCH_CHECK(raw_qweight.scalar_type() == at::kByte, "raw_qweight must be uint8");
+  TORCH_CHECK(weights.scalar_type() == at::kChar, "weights must be int8");
+  TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be float16");
+  TORCH_CHECK(minimums.scalar_type() == at::kHalf, "minimums must be float16");
+  TORCH_CHECK(raw_qweight.dim() == 2, "raw_qweight must be rank 2 [N, blocks * 24]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be rank 2 [N, blocks * 32]");
+  TORCH_CHECK(scales.dim() == 2, "scales must be rank 2 [N, blocks]");
+  TORCH_CHECK(minimums.dim() == 2, "minimums must be rank 2 [N, blocks]");
+  TORCH_CHECK(raw_qweight.size(0) > 0, "raw_qweight must contain at least one row");
+  TORCH_CHECK(
+      raw_qweight.size(1) > 0 && raw_qweight.size(1) % kQ51BytesPerBlock == 0,
+      "raw_qweight width must be a non-zero multiple of 24");
+
+  const int64_t rows = raw_qweight.size(0);
+  const int64_t blocks_per_row = raw_qweight.size(1) / kQ51BytesPerBlock;
+  TORCH_CHECK(
+      weights.size(0) == rows && weights.size(1) == blocks_per_row * kQ51ValuesPerBlock,
+      "weights shape must be [N, blocks * 32]");
+  TORCH_CHECK(scales.size(0) == rows && scales.size(1) == blocks_per_row, "scales shape must be [N, blocks]");
+  TORCH_CHECK(minimums.sizes() == scales.sizes(), "minimums shape must match scales shape");
+
+  c10::DeviceGuard device_guard(raw_qweight.device());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+  launch_q5_1_prepare(
+      queue,
+      raw_qweight.data_ptr<uint8_t>(),
+      weights.data_ptr<int8_t>(),
+      reinterpret_cast<uint16_t*>(scales.data_ptr()),
+      reinterpret_cast<uint16_t*>(minimums.data_ptr()),
       rows,
       blocks_per_row);
 }

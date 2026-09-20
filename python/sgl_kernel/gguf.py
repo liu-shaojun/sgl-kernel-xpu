@@ -28,6 +28,9 @@ Q3_K_GROUP_SIZE = 16
 IQ3_S_BLOCK_BYTES = 110
 IQ3_S_VALUES_PER_BLOCK = 256
 IQ3_S_GROUP_SIZE = 32
+Q5_1_BLOCK_BYTES = 24
+Q5_1_VALUES_PER_BLOCK = 32
+Q5_1_GROUP_SIZE = 32
 
 
 def gguf_q4_k_grouped_mm(
@@ -346,6 +349,24 @@ def gguf_iq3_s_prepare(
     return weights, scales
 
 
+def gguf_q5_1_prepare(
+    raw_qweight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare Q5_1 codes, FP16 scales, and subtractive FP16 offsets."""
+    _validate_q5_1(raw_qweight)
+    rows = raw_qweight.shape[0]
+    blocks = raw_qweight.shape[1] // Q5_1_BLOCK_BYTES
+    weights = torch.empty(
+        (rows, blocks * Q5_1_VALUES_PER_BLOCK),
+        dtype=torch.int8,
+        device=raw_qweight.device,
+    )
+    scales = torch.empty((rows, blocks), dtype=torch.float16, device=raw_qweight.device)
+    minimums = torch.empty_like(scales)
+    torch.ops.sgl_kernel.gguf_q5_1_prepare(raw_qweight, weights, scales, minimums)
+    return weights, scales, minimums
+
+
 def _validate_q4_k(raw_qweight: torch.Tensor) -> None:
     """Validate the common raw Q4_K matrix contract."""
     if raw_qweight.dtype != torch.uint8:
@@ -466,6 +487,21 @@ def _validate_iq3_s(raw_qweight: torch.Tensor) -> None:
         )
 
 
+def _validate_q5_1(raw_qweight: torch.Tensor) -> None:
+    """Validate the common raw Q5_1 matrix contract."""
+    if raw_qweight.dtype != torch.uint8:
+        raise TypeError(f"raw_qweight must be uint8, got {raw_qweight.dtype}")
+    if raw_qweight.ndim != 2:
+        raise ValueError(f"raw_qweight must be rank 2, got {raw_qweight.ndim}")
+    if raw_qweight.shape[0] == 0:
+        raise ValueError("raw_qweight must contain at least one row")
+    if raw_qweight.shape[1] == 0 or raw_qweight.shape[1] % Q5_1_BLOCK_BYTES:
+        raise ValueError(
+            "raw_qweight width must be a non-zero multiple of "
+            f"{Q5_1_BLOCK_BYTES}, got {raw_qweight.shape[1]}"
+        )
+
+
 __all__ = [
     "Q4_K_BLOCK_BYTES",
     "Q4_K_GROUP_SIZE",
@@ -491,6 +527,9 @@ __all__ = [
     "IQ3_S_BLOCK_BYTES",
     "IQ3_S_GROUP_SIZE",
     "IQ3_S_VALUES_PER_BLOCK",
+    "Q5_1_BLOCK_BYTES",
+    "Q5_1_GROUP_SIZE",
+    "Q5_1_VALUES_PER_BLOCK",
     "gguf_q4_k_grouped_mm",
     "gguf_q4_k_prepare",
     "gguf_q4_k_repack",
@@ -504,4 +543,5 @@ __all__ = [
     "gguf_iq4_nl_prepare",
     "gguf_q3_k_prepare",
     "gguf_iq3_s_prepare",
+    "gguf_q5_1_prepare",
 ]
