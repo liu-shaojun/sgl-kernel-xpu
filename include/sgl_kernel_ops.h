@@ -780,6 +780,10 @@ void gguf_iq4_nl_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weight
 // [N, blocks * 256] and FP16 scales [N, blocks * 16].
 void gguf_q3_k_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales);
 
+// Expand raw GGUF IQ3_S blocks [N, blocks * 110] into signed INT8 values
+// [N, blocks * 256] and FP16 scales [N, blocks * 8].
+void gguf_iq3_s_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales);
+
 // Direct GGUF Q8_0 grouped GEMM. Weights are signed INT8 [E, N, K] and
 // scales retain the GGUF FP16 value for each 32-value block [E, N, K/32].
 void gguf_q8_0_grouped_mm(

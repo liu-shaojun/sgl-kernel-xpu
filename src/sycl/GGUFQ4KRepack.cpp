@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "sgl_kernel_export.h"
 #include "sycl/Utils.h"
+#include "sycl/gguf_iq3_s_grid.h"
 
 namespace {
 
@@ -47,6 +48,9 @@ constexpr int kIQ4NLBytesPerBlock = 18;
 constexpr int kQ3KValuesPerBlock = 256;
 constexpr int kQ3KBytesPerBlock = 110;
 constexpr int kQ3KGroupsPerBlock = 16;
+constexpr int kIQ3SValuesPerBlock = 256;
+constexpr int kIQ3SBytesPerBlock = 110;
+constexpr int kIQ3SGroupsPerBlock = 8;
 constexpr int8_t kIQ4Values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 template <typename ScaleT>
@@ -59,6 +63,7 @@ class GGUFQ5KPrepareKernel;
 class GGUFIQ4XSPrepareKernel;
 class GGUFIQ4NLPrepareKernel;
 class GGUFQ3KPrepareKernel;
+class GGUFIQ3SPrepareKernel;
 
 inline int64_t round_up(int64_t value, int64_t multiple) {
   return (value + multiple - 1) / multiple * multiple;
@@ -421,6 +426,54 @@ void launch_q3_k_prepare(
   });
 }
 
+void launch_iq3_s_prepare(
+    sycl::queue& queue, const uint8_t* raw, int8_t* weights, uint16_t* scales, int64_t rows, int64_t blocks_per_row) {
+  const int64_t block_count = rows * blocks_per_row;
+  constexpr int64_t kLocalSize = 256;
+  const int64_t global_size = round_up(block_count, kLocalSize);
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<GGUFIQ3SPrepareKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), [=](sycl::nd_item<1> item) {
+          const int64_t block_idx = item.get_global_linear_id();
+          if (block_idx >= block_count) {
+            return;
+          }
+
+          const uint8_t* src = raw + block_idx * kIQ3SBytesPerBlock;
+          const uint16_t d_bits = static_cast<uint16_t>(src[0]) | (static_cast<uint16_t>(src[1]) << 8);
+          const sycl::half d = sycl::bit_cast<sycl::half>(d_bits);
+          const uint8_t* qs = src + 2;
+          const uint8_t* qh = src + 66;
+          const uint8_t* signs = src + 74;
+          const uint8_t* scale_meta = src + 106;
+          int8_t* dst = weights + block_idx * kIQ3SValuesPerBlock;
+          uint16_t* dst_scales = scales + block_idx * kIQ3SGroupsPerBlock;
+
+#pragma unroll
+          for (int group = 0; group < kIQ3SGroupsPerBlock; ++group) {
+            const int scale_nibble = (scale_meta[group / 2] >> ((group & 1) * 4)) & 0x0f;
+            const sycl::half scale = d * static_cast<sycl::half>(1 + 2 * scale_nibble);
+            dst_scales[group] = sycl::bit_cast<uint16_t>(scale);
+
+#pragma unroll
+            for (int grid_in_group = 0; grid_in_group < 8; ++grid_in_group) {
+              const int grid_idx = group * 8 + grid_in_group;
+              const int lut_idx = qs[grid_idx] | (((qh[grid_idx / 8] >> (grid_idx & 7)) & 0x01) << 8);
+              const uint32_t packed_grid = kIQ3SGrid[lut_idx];
+#pragma unroll
+              for (int component = 0; component < 4; ++component) {
+                const int value_idx = grid_idx * 4 + component;
+                const int magnitude = static_cast<int>((packed_grid >> (component * 8)) & 0xff) >> 2;
+                const bool negative = ((signs[value_idx / 8] >> (value_idx & 7)) & 0x01) != 0;
+                dst[value_idx] = static_cast<int8_t>(negative ? -magnitude : magnitude);
+              }
+            }
+          }
+        });
+  });
+}
+
 void check_same_device(const torch::Tensor& tensor, const torch::Tensor& raw, const char* name) {
   TORCH_CHECK(tensor.device() == raw.device(), name, " must be on the same device as raw_qweight");
 }
@@ -769,6 +822,46 @@ gguf_q3_k_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torc
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   launch_q3_k_prepare(
+      queue,
+      raw_qweight.data_ptr<uint8_t>(),
+      weights.data_ptr<int8_t>(),
+      reinterpret_cast<uint16_t*>(scales.data_ptr()),
+      rows,
+      blocks_per_row);
+}
+
+SGL_KERNEL_EXPORT void
+gguf_iq3_s_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales) {
+  CHECK_INPUT(raw_qweight);
+  CHECK_INPUT(weights);
+  CHECK_INPUT(scales);
+  check_same_device(weights, raw_qweight, "weights");
+  check_same_device(scales, raw_qweight, "scales");
+
+  TORCH_CHECK(raw_qweight.scalar_type() == at::kByte, "raw_qweight must be uint8");
+  TORCH_CHECK(weights.scalar_type() == at::kChar, "weights must be int8");
+  TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be float16");
+  TORCH_CHECK(raw_qweight.dim() == 2, "raw_qweight must be rank 2 [N, blocks * 110]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be rank 2 [N, blocks * 256]");
+  TORCH_CHECK(scales.dim() == 2, "scales must be rank 2 [N, blocks * 8]");
+  TORCH_CHECK(raw_qweight.size(0) > 0, "raw_qweight must contain at least one row");
+  TORCH_CHECK(
+      raw_qweight.size(1) > 0 && raw_qweight.size(1) % kIQ3SBytesPerBlock == 0,
+      "raw_qweight width must be a non-zero multiple of 110");
+
+  const int64_t rows = raw_qweight.size(0);
+  const int64_t blocks_per_row = raw_qweight.size(1) / kIQ3SBytesPerBlock;
+  TORCH_CHECK(
+      weights.size(0) == rows && weights.size(1) == blocks_per_row * kIQ3SValuesPerBlock,
+      "weights shape must be [N, blocks * 256]");
+  TORCH_CHECK(
+      scales.size(0) == rows && scales.size(1) == blocks_per_row * kIQ3SGroupsPerBlock,
+      "scales shape must be [N, blocks * 8]");
+
+  c10::DeviceGuard device_guard(raw_qweight.device());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+  launch_iq3_s_prepare(
       queue,
       raw_qweight.data_ptr<uint8_t>(),
       weights.data_ptr<int8_t>(),
