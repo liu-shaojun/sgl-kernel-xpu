@@ -115,6 +115,7 @@ from sgl_kernel.gguf import (
     gguf_q4_k_repack,
     gguf_q5_k_grouped_mm,
     gguf_q5_k_prepare,
+    gguf_iq4_xs_prepare,
     gguf_q6_k_grouped_mm,
     gguf_q6_k_prepare,
     gguf_q8_0_grouped_mm,
