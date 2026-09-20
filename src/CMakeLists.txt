@@ -165,6 +165,8 @@ if(USE_MOE)
     endif()
     # Compact GGUF Q4_K is AOT-only for now, including in runtime-JIT builds.
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ4KXe20.cmake)
+    # GGUF Q8_0 reuses the same AOT SYCL-TLA policy registry.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ80Xe20.cmake)
 endif()
 
 

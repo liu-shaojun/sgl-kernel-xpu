@@ -1,0 +1,114 @@
+#define SYCL_INTEL_TARGET 20
+
+#include <torch/all.h>
+
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/sycl.hpp>
+
+#include "sycl/kernels/moe/xe20/w4a16_launch_policy.hpp"
+
+namespace moe_w4a16 {
+namespace detail = cute::detail;
+}
+
+#include "sycl/kernels/moe/xe20/w4a16/grouped_gemm_xe2.hpp"
+
+namespace moe_w4a16 {
+using namespace cute;
+
+template <typename, class>
+class GemmQ80CuteName;
+
+template <class Policy, typename ElementA>
+void q8_0_launch(
+    sycl::queue stream,
+    const void* activations,
+    const void* weights,
+    const void* scales,
+    void* outputs,
+    const int gemm_n,
+    const int gemm_k,
+    const int* rows_per_expert,
+    const int total_rows,
+    const int num_experts,
+    int32_t* atomic_buffer) {
+  using ElementA_non_CV = cutlass::platform::remove_cv_t<ElementA>;
+  auto op = XE_DPAS_TT<8, float, ElementA_non_CV>{};
+
+  using WGTile = typename Policy::WGTile;
+  using SGLayout = typename Policy::SGLayout;
+  using MMA = typename TiledMMAHelper<MMA_Atom<decltype(op)>, Layout<WGTile>, SGLayout>::TiledMMA;
+  auto mma = MMA{};
+
+  int sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
+  auto max_threads_per_workgroup = size(mma);
+  static constexpr int kMaxThreadsPerSM = 512;
+  TORCH_CHECK(
+      kMaxThreadsPerSM % max_threads_per_workgroup == 0, "MaxThreadsPerSM must be divisible by MaxThreadsPerWorkgroup");
+
+  sycl::range<3> local(1, 1, max_threads_per_workgroup);
+  sycl::range<3> global(1, sm_count * kMaxThreadsPerSM / max_threads_per_workgroup, 1);
+  namespace syclex = sycl::ext::oneapi::experimental;
+  namespace intelex = sycl::ext::intel::experimental;
+  syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
+
+  using GmemTiledCopyA = typename Policy::GmemTiledCopyA;
+  using GmemTiledCopyB = typename Policy::GmemTiledCopyB;
+  using GmemTiledCopyD = typename Policy::GmemTiledCopyD;
+
+  stream.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), cgh);
+    cgh.parallel_for<GemmQ80CuteName<ElementA, Policy>>(
+        sycl::nd_range<3>{global * local, local}, kernel_props, [=](auto) {
+          moe_w4a16::MoEGEMM<
+              GmemTiledCopyA,
+              GmemTiledCopyB,
+              GmemTiledCopyD,
+              'R',
+              'C',
+              'R',
+              false,
+              false,
+              Policy::StealChunk,
+              Policy::PrefetchDist,
+              Policy::MainloopBarrier,
+              Policy::RowExtend,
+              Policy::SkipPaddedN>(
+              static_cast<const ElementA*>(activations),
+              static_cast<const int8_t*>(weights),
+              static_cast<const cutlass::half_t*>(scales),
+              static_cast<const cutlass::half_t*>(nullptr),
+              static_cast<const uint8_t*>(nullptr),
+              static_cast<const float*>(nullptr),
+              static_cast<ElementA*>(outputs),
+              mma,
+              rows_per_expert,
+              total_rows,
+              num_experts,
+              32,
+              gemm_n,
+              gemm_k,
+              atomic_buffer,
+              local_mem);
+        });
+  });
+}
+
+}  // namespace moe_w4a16
+
+// clang-format off
+template __attribute__((visibility("default"))) void moe_w4a16::q8_0_launch<moe_w4a16::@POLICY@, @ELEMENT_A@>(
+    sycl::queue,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    const int,
+    const int,
+    const int*,
+    const int,
+    const int,
+    int32_t*);
+// clang-format on
+
+#undef SYCL_INTEL_TARGET

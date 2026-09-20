@@ -113,6 +113,8 @@ from sgl_kernel.gguf import (
     gguf_q4_k_grouped_mm,
     gguf_q4_k_prepare,
     gguf_q4_k_repack,
+    gguf_q8_0_grouped_mm,
+    gguf_q8_0_prepare,
 )
 from sgl_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,

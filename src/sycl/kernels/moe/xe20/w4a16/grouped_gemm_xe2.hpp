@@ -102,6 +102,7 @@ CUTE_DEVICE void MoEGEMM(
   static constexpr bool is_B_int4 = (std::is_same_v<ElementB, uint8_t>) && (!std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) && (std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
+  static constexpr bool is_B_int8 = std::is_same_v<ElementB, int8_t>;
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_tile = mma.tile_mnk();
@@ -159,8 +160,9 @@ CUTE_DEVICE void MoEGEMM(
     }
     if constexpr (CompactQ4K) {
       ptr_Q4KMetadata_curr_batch = Q4KMetadata + static_cast<int64_t>(expert_id) * gemm_n * (gemm_k / 256) * 16;
-    } else if constexpr (is_B_4bits) {
-      ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + B_offset * 2 / group_size;
+    } else if constexpr (is_B_4bits || is_B_int8) {
+      constexpr int values_per_storage = is_B_4bits ? 2 : 1;
+      ptr_Scales_curr_batch = const_cast<ElementS*>(Scales) + B_offset * values_per_storage / group_size;
       if constexpr (HasZero) {
         ptr_Zeros_curr_batch = const_cast<ElementS*>(Zeros) + B_offset * 2 / group_size;
       }
@@ -214,39 +216,41 @@ CUTE_DEVICE void MoEGEMM(
       int m_coord = (group_m_id - pre_tiles);
       auto tile_coord = make_coord(m_coord, n_coord, _, 0);
 
-      if constexpr (is_B_4bits) {
-#define XE_GEMM_4BITS_CALLER(GroupSize) \
-  xe_gemm_4bits<                        \
-      GmemTiledCopyA,                   \
-      GmemTiledCopyB,                   \
-      GmemTiledCopyD,                   \
-      GroupSize,                        \
-      HasZero,                          \
-      CompactQ4K,                       \
-      PrefetchDist,                     \
-      MainloopBarrier,                  \
-      SkipPaddedN>(                     \
-      A_tensor,                         \
-      B_tensor,                         \
-      ptr_Scales_curr_batch,            \
-      ptr_Zeros_curr_batch,             \
-      ptr_Q4KMetadata_curr_batch,       \
-      ptr_Bias_curr_batch,              \
-      D_tensor,                         \
-      tile_coord,                       \
+      if constexpr (is_B_4bits || is_B_int8) {
+#define XE_GEMM_QUANTIZED_CALLER(GroupSize) \
+  xe_gemm_quantized<                        \
+      GmemTiledCopyA,                       \
+      GmemTiledCopyB,                       \
+      GmemTiledCopyD,                       \
+      GroupSize,                            \
+      HasZero,                              \
+      CompactQ4K,                           \
+      PrefetchDist,                         \
+      MainloopBarrier,                      \
+      SkipPaddedN>(                         \
+      A_tensor,                             \
+      B_tensor,                             \
+      ptr_Scales_curr_batch,                \
+      ptr_Zeros_curr_batch,                 \
+      ptr_Q4KMetadata_curr_batch,           \
+      ptr_Bias_curr_batch,                  \
+      D_tensor,                             \
+      tile_coord,                           \
       mma);
-        if constexpr (CompactQ4K) {
-          XE_GEMM_4BITS_CALLER(32)
+        if constexpr (is_B_int8) {
+          XE_GEMM_QUANTIZED_CALLER(32)
+        } else if constexpr (CompactQ4K) {
+          XE_GEMM_QUANTIZED_CALLER(32)
         } else if (group_size == 32) {
-          XE_GEMM_4BITS_CALLER(32)
+          XE_GEMM_QUANTIZED_CALLER(32)
         } else if (group_size == 64) {
-          XE_GEMM_4BITS_CALLER(64)
+          XE_GEMM_QUANTIZED_CALLER(64)
         } else if (group_size == 128) {
-          XE_GEMM_4BITS_CALLER(128)
+          XE_GEMM_QUANTIZED_CALLER(128)
         } else if (group_size == 256) {
-          XE_GEMM_4BITS_CALLER(256)
+          XE_GEMM_QUANTIZED_CALLER(256)
         }
-#undef XE_GEMM_4BITS_CALLER
+#undef XE_GEMM_QUANTIZED_CALLER
       } else {
         moe_xe20::xe_gemm<GmemTiledCopyA, GmemTiledCopyB, GmemTiledCopyD>(
             A_tensor, B_tensor, ptr_Scales_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);

@@ -81,7 +81,7 @@ template <
     class TiledMMA,
     typename ElementS,
     typename ElementBI>
-CUTE_DEVICE void xe_gemm_4bits(
+CUTE_DEVICE void xe_gemm_quantized(
     ATensor const& A,  // (M,K)
     BTensor const& B,  // (N,K)
     const ElementS* Scales,
@@ -94,6 +94,10 @@ CUTE_DEVICE void xe_gemm_4bits(
   using TA = typename ATensor::element_type;
   using TB = typename BTensor::element_type;
   static constexpr int group_size = GroupSize;
+  static_assert(
+      std::is_same_v<TB, int4_t> || std::is_same_v<TB, uint4_t> || std::is_same_v<TB, float_e2m1_t> ||
+          std::is_same_v<TB, int8_t>,
+      "quantized GEMM supports INT4, MXFP4, compact Q4_K, and signed INT8 weights");
   static_assert(!CompactQ4K || (GroupSize == 32 && !HasZero), "compact Q4_K uses 32-value groups without zero points");
   static constexpr int sg_local_range = 16;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -414,7 +418,7 @@ CUTE_DEVICE void xe_gemm_4bits(
               zero_ptr[slot] = zp + 1;
             }
             scaleStoreType scale;
-            if constexpr (std::is_same_v<TB, int4_t>) {
+            if constexpr (std::is_same_v<TB, int4_t> || std::is_same_v<TB, int8_t>) {
               scale = sp[0];
             } else if constexpr (std::is_same_v<TB, uint4_t>) {
               scale = static_cast<scaleStoreType>(sp[0]);

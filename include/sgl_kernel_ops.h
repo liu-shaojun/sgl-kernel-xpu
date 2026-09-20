@@ -755,6 +755,20 @@ void gguf_q4_k_repack(
     const torch::Tensor& raw_qweight, torch::Tensor& packed_qweight, torch::Tensor& scales, torch::Tensor& zeros);
 void gguf_q4_k_prepare(const torch::Tensor& raw_qweight, torch::Tensor& packed_qweight, torch::Tensor& metadata);
 
+// Split raw GGUF Q8_0 blocks [N, blocks * 34] into signed INT8 weights
+// [N, blocks * 32] and their original FP16 scales [N, blocks].
+void gguf_q8_0_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales);
+
+// Direct GGUF Q8_0 grouped GEMM. Weights are signed INT8 [E, N, K] and
+// scales retain the GGUF FP16 value for each 32-value block [E, N, K/32].
+void gguf_q8_0_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& scales,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts);
+
 // FP8 weight-only MoE grouped GEMM. Activations are BF16, weights are FP8
 // E4M3, and weight_scales is [E, 1]/[E, 2] for per-expert scalar scales or
 // [E, ceil(N/128), K/128] for 128x128 block scales.

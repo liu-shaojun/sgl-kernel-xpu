@@ -138,6 +138,7 @@ set(SGL_XE20_BUNDLE_PREFIXES
   "GroupGemmXe20_inst_"
   "GroupGemmW4A16Xe20_inst_"
   "GroupGemmW8A16Xe20_inst_"
+  "GroupGemmQ80Xe20_inst_"
   "xe_fmha_fwd_decode_page_"
   "xe_fmha_fwd_decode_nopage_"
   "xe_fmha_fwd_split_decode_page_"

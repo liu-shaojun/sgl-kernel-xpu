@@ -8,6 +8,8 @@ Q4_K_BLOCK_BYTES = 144
 Q4_K_VALUES_PER_BLOCK = 256
 Q4_K_GROUP_SIZE = 32
 Q4_K_METADATA_BYTES = 16
+Q8_0_BLOCK_BYTES = 34
+Q8_0_VALUES_PER_BLOCK = 32
 
 
 def gguf_q4_k_grouped_mm(
@@ -98,6 +100,53 @@ def gguf_q4_k_repack(
     return packed, scales, zeros
 
 
+def gguf_q8_0_prepare(
+    raw_qweight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split raw Q8_0 blocks into signed values and their original FP16 scales.
+
+    The outputs consume exactly the same number of bytes as the GGUF input.
+    """
+    _validate_q8_0(raw_qweight)
+    rows = raw_qweight.shape[0]
+    blocks = raw_qweight.shape[1] // Q8_0_BLOCK_BYTES
+    weights = torch.empty(
+        (rows, blocks * Q8_0_VALUES_PER_BLOCK),
+        dtype=torch.int8,
+        device=raw_qweight.device,
+    )
+    scales = torch.empty((rows, blocks), dtype=torch.float16, device=raw_qweight.device)
+    torch.ops.sgl_kernel.gguf_q8_0_prepare(raw_qweight, weights, scales)
+    return weights, scales
+
+
+def gguf_q8_0_grouped_mm(
+    activations: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    rows_per_expert: torch.Tensor,
+) -> torch.Tensor:
+    """Multiply activations by compact Q8_0 expert weights."""
+    if activations.ndim != 2:
+        raise ValueError("activations must be rank 2 [total_m, K]")
+    if weights.ndim != 3:
+        raise ValueError("weights must be rank 3 [E, N, K]")
+    output = torch.empty(
+        (activations.shape[0], weights.shape[1]),
+        dtype=activations.dtype,
+        device=activations.device,
+    )
+    torch.ops.sgl_kernel.gguf_q8_0_grouped_mm(
+        output,
+        activations,
+        weights,
+        scales,
+        rows_per_expert,
+        weights.shape[0],
+    )
+    return output
+
+
 def _validate_q4_k(raw_qweight: torch.Tensor) -> None:
     """Validate the common raw Q4_K matrix contract."""
     if raw_qweight.dtype != torch.uint8:
@@ -113,12 +162,31 @@ def _validate_q4_k(raw_qweight: torch.Tensor) -> None:
         )
 
 
+def _validate_q8_0(raw_qweight: torch.Tensor) -> None:
+    """Validate the common raw Q8_0 matrix contract."""
+    if raw_qweight.dtype != torch.uint8:
+        raise TypeError(f"raw_qweight must be uint8, got {raw_qweight.dtype}")
+    if raw_qweight.ndim != 2:
+        raise ValueError(f"raw_qweight must be rank 2, got {raw_qweight.ndim}")
+    if raw_qweight.shape[0] == 0:
+        raise ValueError("raw_qweight must contain at least one row")
+    if raw_qweight.shape[1] == 0 or raw_qweight.shape[1] % Q8_0_BLOCK_BYTES:
+        raise ValueError(
+            "raw_qweight width must be a non-zero multiple of "
+            f"{Q8_0_BLOCK_BYTES}, got {raw_qweight.shape[1]}"
+        )
+
+
 __all__ = [
     "Q4_K_BLOCK_BYTES",
     "Q4_K_GROUP_SIZE",
     "Q4_K_METADATA_BYTES",
     "Q4_K_VALUES_PER_BLOCK",
+    "Q8_0_BLOCK_BYTES",
+    "Q8_0_VALUES_PER_BLOCK",
     "gguf_q4_k_grouped_mm",
     "gguf_q4_k_prepare",
     "gguf_q4_k_repack",
+    "gguf_q8_0_grouped_mm",
+    "gguf_q8_0_prepare",
 ]
