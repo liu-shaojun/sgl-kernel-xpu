@@ -42,6 +42,9 @@ constexpr int kQ5KGroupsPerBlock = 8;
 constexpr int kIQ4XSValuesPerBlock = 256;
 constexpr int kIQ4XSBytesPerBlock = 136;
 constexpr int kIQ4XSGroupsPerBlock = 8;
+constexpr int kIQ4NLValuesPerBlock = 32;
+constexpr int kIQ4NLBytesPerBlock = 18;
+constexpr int8_t kIQ4Values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 template <typename ScaleT>
 class GGUFQ4KRepackKernel;
@@ -51,6 +54,7 @@ class GGUFQ80PrepareKernel;
 class GGUFQ6KPrepareKernel;
 class GGUFQ5KPrepareKernel;
 class GGUFIQ4XSPrepareKernel;
+class GGUFIQ4NLPrepareKernel;
 
 inline int64_t round_up(int64_t value, int64_t multiple) {
   return (value + multiple - 1) / multiple * multiple;
@@ -308,7 +312,6 @@ void launch_iq4_xs_prepare(
   queue.submit([&](sycl::handler& cgh) {
     cgh.parallel_for<GGUFIQ4XSPrepareKernel>(
         sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), [=](sycl::nd_item<1> item) {
-          constexpr int8_t kValues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
           const int64_t block_idx = item.get_global_linear_id();
           if (block_idx >= block_count) {
             return;
@@ -334,8 +337,35 @@ void launch_iq4_xs_prepare(
 #pragma unroll
             for (int i = 0; i < 32; ++i) {
               const int nibble = (qsrc[i & 15] >> ((i / 16) * 4)) & 0x0f;
-              dst[group * 32 + i] = kValues[nibble];
+              dst[group * 32 + i] = kIQ4Values[nibble];
             }
+          }
+        });
+  });
+}
+
+void launch_iq4_nl_prepare(
+    sycl::queue& queue, const uint8_t* raw, int8_t* weights, uint16_t* scales, int64_t rows, int64_t blocks_per_row) {
+  const int64_t block_count = rows * blocks_per_row;
+  constexpr int64_t kLocalSize = 256;
+  const int64_t global_size = round_up(block_count, kLocalSize);
+
+  queue.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for<GGUFIQ4NLPrepareKernel>(
+        sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kLocalSize)), [=](sycl::nd_item<1> item) {
+          const int64_t block_idx = item.get_global_linear_id();
+          if (block_idx >= block_count) {
+            return;
+          }
+
+          const uint8_t* src = raw + block_idx * kIQ4NLBytesPerBlock;
+          scales[block_idx] = static_cast<uint16_t>(src[0]) | (static_cast<uint16_t>(src[1]) << 8);
+          int8_t* dst = weights + block_idx * kIQ4NLValuesPerBlock;
+
+#pragma unroll
+          for (int i = 0; i < 32; ++i) {
+            const int nibble = (src[2 + (i & 15)] >> ((i / 16) * 4)) & 0x0f;
+            dst[i] = kIQ4Values[nibble];
           }
         });
   });
@@ -611,6 +641,44 @@ gguf_iq4_xs_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, to
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   launch_iq4_xs_prepare(
+      queue,
+      raw_qweight.data_ptr<uint8_t>(),
+      weights.data_ptr<int8_t>(),
+      reinterpret_cast<uint16_t*>(scales.data_ptr()),
+      rows,
+      blocks_per_row);
+}
+
+SGL_KERNEL_EXPORT void
+gguf_iq4_nl_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales) {
+  CHECK_INPUT(raw_qweight);
+  CHECK_INPUT(weights);
+  CHECK_INPUT(scales);
+  check_same_device(weights, raw_qweight, "weights");
+  check_same_device(scales, raw_qweight, "scales");
+
+  TORCH_CHECK(raw_qweight.scalar_type() == at::kByte, "raw_qweight must be uint8");
+  TORCH_CHECK(weights.scalar_type() == at::kChar, "weights must be int8");
+  TORCH_CHECK(scales.scalar_type() == at::kHalf, "scales must be float16");
+  TORCH_CHECK(raw_qweight.dim() == 2, "raw_qweight must be rank 2 [N, blocks * 18]");
+  TORCH_CHECK(weights.dim() == 2, "weights must be rank 2 [N, blocks * 32]");
+  TORCH_CHECK(scales.dim() == 2, "scales must be rank 2 [N, blocks]");
+  TORCH_CHECK(raw_qweight.size(0) > 0, "raw_qweight must contain at least one row");
+  TORCH_CHECK(
+      raw_qweight.size(1) > 0 && raw_qweight.size(1) % kIQ4NLBytesPerBlock == 0,
+      "raw_qweight width must be a non-zero multiple of 18");
+
+  const int64_t rows = raw_qweight.size(0);
+  const int64_t blocks_per_row = raw_qweight.size(1) / kIQ4NLBytesPerBlock;
+  TORCH_CHECK(
+      weights.size(0) == rows && weights.size(1) == blocks_per_row * kIQ4NLValuesPerBlock,
+      "weights shape must be [N, blocks * 32]");
+  TORCH_CHECK(scales.size(0) == rows && scales.size(1) == blocks_per_row, "scales shape must be [N, blocks]");
+
+  c10::DeviceGuard device_guard(raw_qweight.device());
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+  launch_iq4_nl_prepare(
       queue,
       raw_qweight.data_ptr<uint8_t>(),
       weights.data_ptr<int8_t>(),
