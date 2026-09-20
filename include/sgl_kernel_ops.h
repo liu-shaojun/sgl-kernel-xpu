@@ -759,9 +759,23 @@ void gguf_q4_k_prepare(const torch::Tensor& raw_qweight, torch::Tensor& packed_q
 // [N, blocks * 32] and their original FP16 scales [N, blocks].
 void gguf_q8_0_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales);
 
+// Expand raw GGUF Q6_K blocks [N, blocks * 210] into signed INT8 values
+// [N, blocks * 256] and combined FP16 scales [N, blocks * 16].
+void gguf_q6_k_prepare(const torch::Tensor& raw_qweight, torch::Tensor& weights, torch::Tensor& scales);
+
 // Direct GGUF Q8_0 grouped GEMM. Weights are signed INT8 [E, N, K] and
 // scales retain the GGUF FP16 value for each 32-value block [E, N, K/32].
 void gguf_q8_0_grouped_mm(
+    torch::Tensor& output,
+    const torch::Tensor& activations,
+    const torch::Tensor& weights,
+    const torch::Tensor& scales,
+    const torch::Tensor& rows_per_expert,
+    const int64_t n_experts);
+
+// Direct GGUF Q6_K grouped GEMM over the prepared signed INT8 values. Q6_K is
+// symmetric and has one FP16 multiplier for every 16 K values.
+void gguf_q6_k_grouped_mm(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,

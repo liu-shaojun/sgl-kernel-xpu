@@ -113,6 +113,8 @@ from sgl_kernel.gguf import (
     gguf_q4_k_grouped_mm,
     gguf_q4_k_prepare,
     gguf_q4_k_repack,
+    gguf_q6_k_grouped_mm,
+    gguf_q6_k_prepare,
     gguf_q8_0_grouped_mm,
     gguf_q8_0_prepare,
 )

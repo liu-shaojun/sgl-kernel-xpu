@@ -167,6 +167,8 @@ if(USE_MOE)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ4KXe20.cmake)
     # GGUF Q8_0 reuses the same AOT SYCL-TLA policy registry.
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ80Xe20.cmake)
+    # Q6_K uses signed INT8 DPAS with one scale per 16-value quantization group.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ6KXe20.cmake)
 endif()
 
 

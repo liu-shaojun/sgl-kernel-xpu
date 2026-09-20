@@ -167,6 +167,10 @@ CUTE_DEVICE void xe_gemm_quantized(
   static constexpr auto tile_n = get<1>(wg_tile);
   static constexpr auto tile_k = get<2>(wg_tile);
   static_assert(!CompactQ4K || tile_k == 32, "compact Q4_K metadata is decoded once per 32-value K tile");
+  static_assert(
+      GroupSize >= tile_k || tile_k % GroupSize == 0,
+      "a K tile must fit in one quantization group or contain whole groups");
+  static constexpr int kScaleGroupsPerTile = GroupSize < tile_k ? tile_k / GroupSize : 1;
 
   static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
   static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
@@ -183,7 +187,7 @@ CUTE_DEVICE void xe_gemm_quantized(
   int x_idx = sg_local_id / channel_num;
 
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
-  scaleStoreType scales[thr_N * channel_num];
+  scaleStoreType scales[thr_N * channel_num * kScaleGroupsPerTile];
   conditional_t<HasZero, TA, uint8_t> zeros[thr_N * channel_num];
   float q4k_scales[CompactQ4K ? thr_N * channel_num : 1];
   float q4k_minimums[CompactQ4K ? thr_N * channel_num : 1];
@@ -411,35 +415,38 @@ CUTE_DEVICE void xe_gemm_quantized(
             q4k_minimums[slot] = q4k_dmin[slot] * static_cast<float>(min6);
           } else {
             const ElementS* sp = scale_ptr[slot];
-            scale_ptr[slot] = sp + 1;
+            scale_ptr[slot] = sp + kScaleGroupsPerTile;
             const ElementS* zp = nullptr;
             if constexpr (HasZero) {
               zp = zero_ptr[slot];
               zero_ptr[slot] = zp + 1;
             }
-            scaleStoreType scale;
-            if constexpr (std::is_same_v<TB, int4_t> || std::is_same_v<TB, int8_t>) {
-              scale = sp[0];
-            } else if constexpr (std::is_same_v<TB, uint4_t>) {
-              scale = static_cast<scaleStoreType>(sp[0]);
-              if constexpr (HasZero) {
-                zeros[slot] = static_cast<TA>(zp[0]);
+            CUTLASS_PRAGMA_UNROLL
+            for (int scale_group = 0; scale_group < kScaleGroupsPerTile; ++scale_group) {
+              scaleStoreType scale;
+              if constexpr (std::is_same_v<TB, int4_t> || std::is_same_v<TB, int8_t>) {
+                scale = sp[scale_group];
+              } else if constexpr (std::is_same_v<TB, uint4_t>) {
+                scale = static_cast<scaleStoreType>(sp[scale_group]);
+                if constexpr (HasZero) {
+                  zeros[slot] = static_cast<TA>(zp[0]);
+                }
+              } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
+                const uint32_t e8m0 = static_cast<uint32_t>(sp[scale_group]);
+                if constexpr (kFuseDequant) {
+                  // Folded into the reorder's own multiply, so it carries the
+                  // conversion constant and the 2^-kFoldShift bias with it.
+                  scale = mxfp4_fold_multiplier(e8m0);
+                } else {
+                  uint32_t scale_u32 = e8m0 << 23;
+                  scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
+                }
               }
-            } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
-              const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);
-              if constexpr (kFuseDequant) {
-                // Folded into the reorder's own multiply, so it carries the
-                // conversion constant and the 2^-kFoldShift bias with it.
-                scale = mxfp4_fold_multiplier(e8m0);
-              } else {
-                uint32_t scale_u32 = e8m0 << 23;
-                scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
-              }
-            }
 
-            scales[slot] = scale;
-            if constexpr (kFuseDequant) {
-              mul_pairs[n][c] = scale;
+              scales[slot * kScaleGroupsPerTile + scale_group] = scale;
+              if constexpr (kFuseDequant) {
+                mul_pairs[n][c] = scale;
+              }
             }
           }
         }
@@ -477,11 +484,17 @@ CUTE_DEVICE void xe_gemm_quantized(
               tCrB(cute::tuple(c, _), n, _)[i] = moe_xe20::apply_bf16_or_fp16_scale(value, scales[n * channel_num + c]);
             }
           } else {
+            static constexpr int kFragmentValuesPerSlot = tCrB.size() / thr_N / channel_num;
+            static_assert(
+                kFragmentValuesPerSlot % kScaleGroupsPerTile == 0, "B fragment must split evenly across scale groups");
+            static constexpr int kFragmentValuesPerScale = kFragmentValuesPerSlot / kScaleGroupsPerTile;
+            const int scale_group = i / kFragmentValuesPerScale;
+            const auto scale = scales[(n * channel_num + c) * kScaleGroupsPerTile + scale_group];
             if constexpr (std::is_same_v<TA, half_t>) {
-              tCrB(cute::tuple(c, _), n, _)[i] *= scales[n * channel_num + c];
+              tCrB(cute::tuple(c, _), n, _)[i] *= scale;
             } else {
               tCrB(cute::tuple(c, _), n, _)[i] =
-                  moe_xe20::apply_bf16_or_fp16_scale(tCrB(cute::tuple(c, _), n, _)[i], scales[n * channel_num + c]);
+                  moe_xe20::apply_bf16_or_fp16_scale(tCrB(cute::tuple(c, _), n, _)[i], scale);
             }
           }
         }

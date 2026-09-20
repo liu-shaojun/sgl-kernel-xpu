@@ -228,6 +228,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gguf_q4_k_prepare", torch::kXPU, &gguf_q4_k_prepare);
   m.def("gguf_q8_0_prepare(Tensor raw_qweight, Tensor! weights, Tensor! scales) -> ()");
   m.impl("gguf_q8_0_prepare", torch::kXPU, &gguf_q8_0_prepare);
+  m.def("gguf_q6_k_prepare(Tensor raw_qweight, Tensor! weights, Tensor! scales) -> ()");
+  m.impl("gguf_q6_k_prepare", torch::kXPU, &gguf_q6_k_prepare);
 
 #ifdef USE_MOE
   m.def(
@@ -267,6 +269,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "gguf_q8_0_grouped_mm(Tensor! output, Tensor activations, Tensor weights, Tensor scales, "
       "Tensor rows_per_expert, int n_experts) -> ()");
   m.impl("gguf_q8_0_grouped_mm", torch::kXPU, &gguf_q8_0_grouped_mm);
+  m.def(
+      "gguf_q6_k_grouped_mm(Tensor! output, Tensor activations, Tensor weights, Tensor scales, "
+      "Tensor rows_per_expert, int n_experts) -> ()");
+  m.impl("gguf_q6_k_grouped_mm", torch::kXPU, &gguf_q6_k_grouped_mm);
 
   m.def(
       "moe_grouped_mm_nt_xe20_fp8_w8a16(Tensor! output, Tensor activations, Tensor weights, "

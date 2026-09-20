@@ -70,6 +70,7 @@ template <
     bool MainloopBarrier,
     bool RowExtend,
     bool SkipPaddedN,
+    int Int8GroupSize = 32,
     class TiledMMA,
     typename ElementA,
     typename ElementB,
@@ -103,6 +104,7 @@ CUTE_DEVICE void MoEGEMM(
   static constexpr bool is_B_mxfp4 = (std::is_same_v<ElementB, uint8_t>) && (std::is_same_v<ElementS, uint8_t>);
   static constexpr bool is_B_4bits = std::is_same_v<ElementB, uint8_t>;
   static constexpr bool is_B_int8 = std::is_same_v<ElementB, int8_t>;
+  static_assert(!is_B_int8 || Int8GroupSize == 16 || Int8GroupSize == 32, "signed INT8 group size must be 16 or 32");
 
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_tile = mma.tile_mnk();
@@ -238,7 +240,7 @@ CUTE_DEVICE void MoEGEMM(
       tile_coord,                           \
       mma);
         if constexpr (is_B_int8) {
-          XE_GEMM_QUANTIZED_CALLER(32)
+          XE_GEMM_QUANTIZED_CALLER(Int8GroupSize)
         } else if constexpr (CompactQ4K) {
           XE_GEMM_QUANTIZED_CALLER(32)
         } else if (group_size == 32) {

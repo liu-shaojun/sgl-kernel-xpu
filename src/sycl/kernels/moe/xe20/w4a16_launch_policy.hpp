@@ -33,4 +33,15 @@ using w4a16_launch_policy_m_64_n_128_skip = w4a16_launch_policy<w4a16_tile<64, 1
 using w4a16_launch_policy_m_64_n_256 = w4a16_launch_policy<w4a16_tile<64, 256, 1, 16>, 1, 2, true, false>;
 using w4a16_launch_policy_m_64_n_256_skip = w4a16_launch_policy<w4a16_tile<64, 256, 1, 16>, 1, 2, true, true>;
 
+// Q6_K has one scale per 16 K values. The quantized mainloop applies two
+// scales to each K=32 fragment, retaining the production W4/Q8 tile shapes and
+// avoiding twice as many mainloop iterations.
+using q6_k_launch_policy_m_8_n_64 = w4a16_launch_policy_m_8_n_64;
+using q6_k_launch_policy_m_16_n_64 = w4a16_launch_policy_m_16_n_64;
+using q6_k_launch_policy_m_32_n_64 = w4a16_launch_policy_m_32_n_64;
+using q6_k_launch_policy_m_64_n_128 = w4a16_launch_policy_m_64_n_128;
+using q6_k_launch_policy_m_64_n_128_skip = w4a16_launch_policy_m_64_n_128_skip;
+using q6_k_launch_policy_m_64_n_256 = w4a16_launch_policy_m_64_n_256;
+using q6_k_launch_policy_m_64_n_256_skip = w4a16_launch_policy_m_64_n_256_skip;
+
 }  // namespace moe_w4a16
