@@ -180,6 +180,8 @@ if(USE_MOE)
     # instances are always built when USE_MOE is on).
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe35.cmake)
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmMxfp4W4A16Xe35.cmake)
+    # Compact GGUF Q4_K is AOT-only for now, including in runtime-JIT builds.
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmQ4KXe20.cmake)
 endif()
 
 

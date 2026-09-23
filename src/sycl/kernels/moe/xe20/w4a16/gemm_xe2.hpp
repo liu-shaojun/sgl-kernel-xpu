@@ -71,6 +71,7 @@ template <
     class GmemTiledCopyC,
     int GroupSize,
     bool HasZero,
+    bool CompactQ4K,
     int PrefetchDist,
     bool MainloopBarrier,
     bool SkipPaddedN,
@@ -85,6 +86,7 @@ CUTE_DEVICE void xe_gemm_4bits(
     BTensor const& B,  // (N,K)
     const ElementS* Scales,
     const ElementS* Zeros,
+    const uint8_t* Q4KMetadata,
     const ElementBI* Bias,
     DTensor& C,  // (M,N)
     Coord<int, int, cute::Underscore, int> blk_coord,
@@ -92,6 +94,7 @@ CUTE_DEVICE void xe_gemm_4bits(
   using TA = typename ATensor::element_type;
   using TB = typename BTensor::element_type;
   static constexpr int group_size = GroupSize;
+  static_assert(!CompactQ4K || (GroupSize == 32 && !HasZero), "compact Q4_K uses 32-value groups without zero points");
   static constexpr int sg_local_range = 16;
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   auto wg_m = get<0>(blk_coord);
@@ -159,6 +162,7 @@ CUTE_DEVICE void xe_gemm_4bits(
   static constexpr auto tile_m = get<0>(wg_tile);
   static constexpr auto tile_n = get<1>(wg_tile);
   static constexpr auto tile_k = get<2>(wg_tile);
+  static_assert(!CompactQ4K || tile_k == 32, "compact Q4_K metadata is decoded once per 32-value K tile");
 
   static constexpr auto SG_M = tile_m / ATOM_M;  // BLK_M / ATOM_M;
   static constexpr auto SG_N = tile_n / ATOM_N;  // BLK_N / ATOM_N;
@@ -177,6 +181,13 @@ CUTE_DEVICE void xe_gemm_4bits(
   using scaleStoreType = conditional_t<is_same_v<TA, half_t>, half_t, float>;
   scaleStoreType scales[thr_N * channel_num];
   conditional_t<HasZero, TA, uint8_t> zeros[thr_N * channel_num];
+  float q4k_scales[CompactQ4K ? thr_N * channel_num : 1];
+  float q4k_minimums[CompactQ4K ? thr_N * channel_num : 1];
+  float q4k_d[CompactQ4K ? thr_N * channel_num : 1];
+  float q4k_dmin[CompactQ4K ? thr_N * channel_num : 1];
+  uint32_t q4k_scale_codes[CompactQ4K ? thr_N * channel_num : 1];
+  uint32_t q4k_min_codes[CompactQ4K ? thr_N * channel_num : 1];
+  uint32_t q4k_high_codes[CompactQ4K ? thr_N * channel_num : 1];
 
   // Where each (n, channel) slot gathers its group scales from, i.e. the start of
   // its B column inside this expert's scale matrix. The N direction is tiled to a
@@ -191,15 +202,21 @@ CUTE_DEVICE void xe_gemm_4bits(
   const int scale_col_bound = size<0>(B.shape()) - 1;
   const ElementS* scale_ptr[thr_N * channel_num];
   const ElementS* zero_ptr[HasZero ? thr_N * channel_num : 1];
+  const uint8_t* q4k_meta_ptr[CompactQ4K ? thr_N * channel_num : 1];
   CUTLASS_PRAGMA_UNROLL
   for (int n = 0; n < thr_N; ++n) {
     CUTLASS_PRAGMA_UNROLL
     for (int c = 0; c < channel_num; ++c) {
       const int col = n_tile_start + n_sg_start + n * sg_local_range + x_idx + c * (sg_local_range / channel_num);
       const int offset = cute::min(col, scale_col_bound) * group_num;
-      scale_ptr[n * channel_num + c] = Scales + offset;
-      if constexpr (HasZero) {
-        zero_ptr[n * channel_num + c] = Zeros + offset;
+      const int slot = n * channel_num + c;
+      if constexpr (CompactQ4K) {
+        q4k_meta_ptr[slot] = Q4KMetadata + cute::min(col, scale_col_bound) * (group_num / 8) * 16;
+      } else {
+        scale_ptr[slot] = Scales + offset;
+        if constexpr (HasZero) {
+          zero_ptr[slot] = Zeros + offset;
+        }
       }
     }
   }
@@ -359,36 +376,67 @@ CUTE_DEVICE void xe_gemm_4bits(
         CUTLASS_PRAGMA_UNROLL
         for (int c = 0; c < channel_num; ++c) {
           const int slot = n * channel_num + c;
-          const ElementS* sp = scale_ptr[slot];
-          scale_ptr[slot] = sp + 1;
-          const ElementS* zp = nullptr;
-          if constexpr (HasZero) {
-            zp = zero_ptr[slot];
-            zero_ptr[slot] = zp + 1;
-          }
-          scaleStoreType scale;
-          if constexpr (std::is_same_v<TB, int4_t>) {
-            scale = sp[0];
-          } else if constexpr (std::is_same_v<TB, uint4_t>) {
-            scale = static_cast<scaleStoreType>(sp[0]);
-            if constexpr (HasZero) {
-              zeros[slot] = static_cast<TA>(zp[0]);
+          if constexpr (CompactQ4K) {
+            const int group = k_tile & 7;
+            const uint8_t* meta = q4k_meta_ptr[slot] + (k_tile >> 3) * 16;
+            if (group == 0) {
+              const uint32_t* words = reinterpret_cast<const uint32_t*>(meta);
+              const uint32_t base_word = words[0];
+              const uint16_t d_bits = base_word & 0xffff;
+              const uint16_t dmin_bits = base_word >> 16;
+              q4k_d[slot] = static_cast<float>(sycl::bit_cast<sycl::half>(d_bits));
+              q4k_dmin[slot] = static_cast<float>(sycl::bit_cast<sycl::half>(dmin_bits));
+              q4k_scale_codes[slot] = words[1];
+              q4k_min_codes[slot] = words[2];
+              q4k_high_codes[slot] = words[3];
             }
-          } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
-            const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);
-            if constexpr (kFuseDequant) {
-              // Folded into the reorder's own multiply, so it carries the
-              // conversion constant and the 2^-kFoldShift bias with it.
-              scale = mxfp4_fold_multiplier(e8m0);
+            int scale6;
+            int min6;
+            if (group < 4) {
+              const int shift = group * 8;
+              scale6 = (q4k_scale_codes[slot] >> shift) & 0x3f;
+              min6 = (q4k_min_codes[slot] >> shift) & 0x3f;
             } else {
-              uint32_t scale_u32 = e8m0 << 23;
-              scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
+              const int high_group = group - 4;
+              const int shift = high_group * 8;
+              const int high = q4k_high_codes[slot] >> shift;
+              scale6 = (high & 0x0f) | ((q4k_scale_codes[slot] >> (shift + 2)) & 0x30);
+              min6 = ((high >> 4) & 0x0f) | ((q4k_min_codes[slot] >> (shift + 2)) & 0x30);
             }
-          }
+            q4k_scales[slot] = q4k_d[slot] * static_cast<float>(scale6);
+            q4k_minimums[slot] = q4k_dmin[slot] * static_cast<float>(min6);
+          } else {
+            const ElementS* sp = scale_ptr[slot];
+            scale_ptr[slot] = sp + 1;
+            const ElementS* zp = nullptr;
+            if constexpr (HasZero) {
+              zp = zero_ptr[slot];
+              zero_ptr[slot] = zp + 1;
+            }
+            scaleStoreType scale;
+            if constexpr (std::is_same_v<TB, int4_t>) {
+              scale = sp[0];
+            } else if constexpr (std::is_same_v<TB, uint4_t>) {
+              scale = static_cast<scaleStoreType>(sp[0]);
+              if constexpr (HasZero) {
+                zeros[slot] = static_cast<TA>(zp[0]);
+              }
+            } else if constexpr (std::is_same_v<TB, float_e2m1_t>) {
+              const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);
+              if constexpr (kFuseDequant) {
+                // Folded into the reorder's own multiply, so it carries the
+                // conversion constant and the 2^-kFoldShift bias with it.
+                scale = mxfp4_fold_multiplier(e8m0);
+              } else {
+                uint32_t scale_u32 = e8m0 << 23;
+                scale = static_cast<scaleStoreType>(reinterpret_cast<float&>(scale_u32));
+              }
+            }
 
-          scales[slot] = scale;
-          if constexpr (kFuseDequant) {
-            mul_pairs[n][c] = scale;
+            scales[slot] = scale;
+            if constexpr (kFuseDequant) {
+              mul_pairs[n][c] = scale;
+            }
           }
         }
       }
@@ -413,7 +461,11 @@ CUTE_DEVICE void xe_gemm_4bits(
       for (int c = 0; c < channel_num; ++c) {
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < tCrB.size() / thr_N / channel_num; ++i) {
-          if constexpr (HasZero) {
+          if constexpr (CompactQ4K) {
+            const int slot = n * channel_num + c;
+            const float value = static_cast<float>(tCrB(cute::tuple(c, _), n, _)[i]);
+            tCrB(cute::tuple(c, _), n, _)[i] = static_cast<TA>(value * q4k_scales[slot] - q4k_minimums[slot]);
+          } else if constexpr (HasZero) {
             TA value = tCrB(cute::tuple(c, _), n, _)[i] - zeros[n * channel_num + c];
             if constexpr (std::is_same_v<TA, half_t>) {
               tCrB(cute::tuple(c, _), n, _)[i] = value * scales[n * channel_num + c];
